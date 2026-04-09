@@ -3,13 +3,15 @@ members = [".", "crates/cube-world", "crates/bbc-renderer"]
 resolver = "2"
 
 [package]
-name = "bbc"
+name = "cube-bauhaus"
 version = "0.1.0"
 edition = "2021"
-description = "BananaBread / Cube2 octree geometry editor — Rust/Vulkan"
+description = "Cube Bauhaus — standalone octree CSG geometry editor for any engine"
+license = "MIT"
+repository = "https://github.com/cronos3k/cube-bauhaus"
 
 [[bin]]
-name = "bbc"
+name = "cube-bauhaus"
 path = "src/main.rs"
 
 [dependencies]

@@ -1,8 +1,8 @@
-# Cube Forge
+# Cube Bauhaus
 
 **Standalone octree CSG geometry editor — build levels for any engine.**
 
-Cube Forge is a real-time octree geometry editor reimplemented in Rust/Vulkan, based on the legendary Cube2/Sauerbraten editing system. It runs as a standalone application and exports optimized meshes with textures to standard formats (GLB, FBX) for use in Unreal Engine, Unity, Godot, or any other game engine.
+Cube Bauhaus is a real-time octree geometry editor reimplemented in Rust/Vulkan, based on the legendary Cube2/Sauerbraten editing system. It runs as a standalone application and exports optimized meshes with textures to standard formats (GLB, FBX) for use in Unreal Engine, Unity, Godot, or any other game engine.
 
 The Cube2 octree CSG system is one of the most elegant real-time geometry editing systems ever created. This project frees that technology from its original engine and makes it available to modern game development.
 
@@ -58,16 +58,16 @@ cargo build --release
 
 ```bash
 # New empty map
-cube-forge
+cube-bauhaus
 
 # Load a Sauerbraten map
-cube-forge path/to/map.ogz
+cube-bauhaus path/to/map.ogz
 ```
 
 ## Architecture
 
 ```
-cube-forge/
+cube-bauhaus/
   src/              # Application: editor state, input, main loop
   crates/
     cube-world/     # Pure geometry: octree, editing, serialize, export (no GPU deps)

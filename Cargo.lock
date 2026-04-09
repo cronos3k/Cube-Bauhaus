@@ -362,24 +362,6 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "c08606f8c3cbf4ce6ec8e28fb0014a2c086708fe954eaa885384a6165172e7e8"
 
 [[package]]
-name = "bbc"
-version = "0.1.0"
-dependencies = [
- "bbc-renderer",
- "bytemuck",
- "clap",
- "cube-world",
- "egui",
- "egui-winit",
- "glam",
- "image",
- "rfd",
- "tracing",
- "tracing-subscriber",
- "winit",
-]
-
-[[package]]
 name = "bbc-renderer"
 version = "0.1.0"
 dependencies = [
@@ -760,6 +742,24 @@ checksum = "78c8292055d1c1df0cce5d180393dc8cce0abec0a7102adb6c7b1eef6016d60a"
 dependencies = [
  "generic-array",
  "typenum",
+]
+
+[[package]]
+name = "cube-bauhaus"
+version = "0.1.0"
+dependencies = [
+ "bbc-renderer",
+ "bytemuck",
+ "clap",
+ "cube-world",
+ "egui",
+ "egui-winit",
+ "glam",
+ "image",
+ "rfd",
+ "tracing",
+ "tracing-subscriber",
+ "winit",
 ]
 
 [[package]]

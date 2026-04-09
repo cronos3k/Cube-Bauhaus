@@ -33,5 +33,5 @@ Cube2/Sauerbraten: http://sauerbraten.org
 BananaBread (Emscripten port): https://github.com/nickshanks/BananaBread
 
 The Cube2 octree CSG system is one of the most elegant real-time geometry
-editing systems ever created. This project exists to bring that technology
+editing systems ever created. Cube Bauhaus exists to bring that technology
 to modern game engines as a standalone level design toolkit.
