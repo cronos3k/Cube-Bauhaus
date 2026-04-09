@@ -1,0 +1,40 @@
+[workspace]
+members = [".", "crates/cube-world", "crates/bbc-renderer"]
+resolver = "2"
+
+[package]
+name = "bbc"
+version = "0.1.0"
+edition = "2021"
+description = "BananaBread / Cube2 octree geometry editor — Rust/Vulkan"
+
+[[bin]]
+name = "bbc"
+path = "src/main.rs"
+
+[dependencies]
+cube-world   = { path = "crates/cube-world" }
+bbc-renderer = { path = "crates/bbc-renderer" }
+
+winit  = "0.29"
+egui = "0.27"
+egui-winit = "0.27"
+glam   = { version = "0.25", features = ["bytemuck"] }
+tracing            = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+bytemuck = { version = "1.14", features = ["derive"] }
+clap = { version = "4.4", features = ["derive"] }
+image = { version = "0.24", default-features = false, features = ["png", "jpeg"] }
+rfd = "0.14"
+
+[profile.dev]
+opt-level = 1
+
+[profile.dev.package.bbc-renderer]
+opt-level = 2
+[profile.dev.package.cube-world]
+opt-level = 2
+
+[profile.release]
+opt-level = 3
+lto = "thin"

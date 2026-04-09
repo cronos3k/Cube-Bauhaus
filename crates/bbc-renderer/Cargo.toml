@@ -1,0 +1,19 @@
+[package]
+name = "bbc-renderer"
+version = "0.1.0"
+edition = "2021"
+description = "Minimal Vulkan forward renderer for BBC (borrowed from woi2, stripped)"
+
+[build-dependencies]
+# none — build.rs calls glslc via std::process::Command
+
+[dependencies]
+ash           = "0.38"
+ash-window    = "0.13"
+raw-window-handle = "0.6"
+gpu-allocator = { version = "0.27", features = ["vulkan"] }
+glam          = { version = "0.25", features = ["bytemuck"] }
+bytemuck      = { version = "1.14", features = ["derive"] }
+tracing       = "0.1"
+winit         = "0.29"
+egui          = "0.27"

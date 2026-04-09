@@ -1,0 +1,24 @@
+# Build artifacts
+/target/
+/target2/
+/BBCtarget2/
+
+# IDE / editor
+.vscode/
+.idea/
+*.swp
+*.swo
+
+# OS files
+Thumbs.db
+Desktop.ini
+.DS_Store
+
+# Screenshots (generated)
+screenshot_*.png
+
+# Test maps (user data)
+/F:BBCtestmaps/
+
+# Claude session data
+.claude/
