@@ -76,9 +76,31 @@ cube-bauhaus/
 
 The `cube-world` crate has zero renderer dependencies — it produces plain vertex/index arrays that any renderer can consume. This makes it reusable as a library for engine plugins.
 
-## Acknowledgments
+## Heritage & Credits
 
-Algorithms and file formats reimplemented from [Cube2/Sauerbraten](http://sauerbraten.org) by Wouter van Oortmerssen (zlib license). This is an independent Rust reimplementation — no original C++ source code is included.
+Cube Bauhaus is built on the shoulders of one of the most influential geometry editing systems in game development history. This is an independent Rust reimplementation — no original C++ source code is included.
+
+### The Creators
+
+- **[Wouter van Oortmerssen (Lee)](http://strlen.com/)** — Creator of the Cube and Cube2/Sauerbraten engines. The octree CSG editing system he designed remains unmatched for real-time level editing. [[Personal site]](http://strlen.com/) [[Sauerbraten]](http://sauerbraten.org/) [[About Lee]](http://sauerbraten.org/lee/)
+- **[Alon Zakai (kripken)](https://github.com/kripken)** — Creator of Emscripten and the [BananaBread](https://github.com/kripken/BananaBread) port, which proved Cube2 could run anywhere — even in a browser. His work on compiling C++ to JavaScript/WebGL was groundbreaking.
+- **[Lee Salzman (lsalzman)](https://github.com/lsalzman)** — Creator of [Tesseract](http://tesseract.gg/), the modern rendering fork of Cube2 with deferred shading, dynamic global illumination, and HDR lighting.
+
+### The Cube Engine Family
+
+| Project | Description |
+|---------|-------------|
+| [Cube / Cube2: Sauerbraten](http://sauerbraten.org/) | The original — real-time octree CSG editing FPS engine |
+| [Tesseract](http://tesseract.gg/) | Modern renderer fork — deferred shading, GI, HDR |
+| [BananaBread](https://github.com/kripken/BananaBread) | Cube2 compiled to JavaScript/WebGL via Emscripten |
+| [Red Eclipse](https://www.redeclipse.net/) | Free arena FPS built on the Cube2/Tesseract engine |
+| [OctaForge](https://github.com/OctaForge) | Scripting-focused Tesseract fork |
+| [Quadropolis (mirror)](https://quadropolis.github.io/) | Community map collection — thousands of user-created levels |
+| [Sauerbraten SVN mirror](https://github.com/embeddedc/sauerbraten) | Git mirror of the official Sauerbraten source |
+
+### Why this project exists
+
+The Cube2 octree CSG system is one of the most elegant real-time geometry editing systems ever created. But it was always locked inside its own engine. Cube Bauhaus frees that technology — edit with the best CSG tools ever made, then export to Unreal, Unity, Godot, or any engine you want.
 
 ## License
 
