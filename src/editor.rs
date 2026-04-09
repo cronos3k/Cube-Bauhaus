@@ -95,12 +95,16 @@ pub struct EditorState {
     // Texture system
     pub tex_registry: TextureRegistry,
 
+    // Entity editing
+    pub selected_entity: Option<usize>,  // index into world.entities
+
     // File operation requests (handled by main.rs)
     pub request_save: bool,
     pub request_load: bool,
     pub request_newmap: bool,
     pub request_export_glb: bool,
     pub request_export_fbx: bool,
+    pub request_package_map: bool,
     pub current_map_path: Option<String>,
     pub packages_dir: Option<String>,
 }
@@ -125,11 +129,13 @@ impl EditorState {
             timestamp: 0,
             mesh_dirty: false,
             tex_registry: Self::make_default_registry(),
+            selected_entity: None,
             request_save: false,
             request_load: false,
             request_newmap: false,
             request_export_glb: false,
             request_export_fbx: false,
+            request_package_map: false,
             current_map_path: None,
             packages_dir: None,
         }
@@ -178,6 +184,10 @@ impl EditorState {
         }
         if inp.ctrl && inp.shift && inp.just_pressed(KeyCode::KeyE) {
             self.request_export_fbx = true;
+            return false;
+        }
+        if inp.ctrl && inp.just_pressed(KeyCode::KeyP) {
+            self.request_package_map = true;
             return false;
         }
         if inp.ctrl && inp.just_pressed(KeyCode::KeyE) {
@@ -247,7 +257,7 @@ impl EditorState {
         self.handle_selection(inp, camera);
 
         // Handle editing input — works on hover OR selection
-        self.handle_editing(inp);
+        self.handle_editing(inp, camera);
 
         // Check if editing ops made the world dirty
         if self.edit_world.dirty {
@@ -427,7 +437,7 @@ impl EditorState {
     // ── Editing operations ────────────────────────────────────────────────────
     // These match the stdedit.cfg universaldelta / editfacewentpush flow.
 
-    fn handle_editing(&mut self, inp: &InputState) {
+    fn handle_editing(&mut self, inp: &InputState, camera: &FlyCamera) {
         // The selection is always valid when we have a hover (even without clicking)
         if !self.selection.is_valid() { return; }
 
@@ -697,6 +707,100 @@ impl EditorState {
             self.edit_world.redo(self.timestamp);
             return;
         }
+
+        // ── Entity editing ───────────────────────────────────────────────
+        // P = place or move playerstart at camera position
+        // N = select nearest entity (cycle through nearby)
+        // Shift+P = delete selected entity
+
+        if inp.just_pressed(KeyCode::KeyP) && !inp.ctrl && !inp.shift {
+            // Camera pos is renderer Y-up; entities store Cube2 Z-up coords
+            let cam_pos = [camera.pos.x, camera.pos.z, camera.pos.y]; // renderer→cube2
+            let yaw_attr = (camera.yaw.to_degrees() as i16 + 360) % 360;
+
+            if let Some(idx) = self.selected_entity {
+                // Move selected entity to camera position
+                if idx < self.edit_world.world.entities.len() {
+                    self.edit_world.world.entities[idx].pos = cam_pos;
+                    self.edit_world.world.entities[idx].attr[0] = yaw_attr as i16;
+                    println!("Moved entity {} to ({:.0}, {:.0}, {:.0})",
+                        idx, cam_pos[0], cam_pos[1], cam_pos[2]);
+                }
+            } else {
+                // Place new playerstart (etype=1)
+                use cube_world::octree::MapEntity;
+                let ent = MapEntity {
+                    pos: cam_pos,
+                    etype: 1, // ET_PLAYERSTART
+                    attr: [yaw_attr as i16, 0, 0, 0, 0],
+                };
+                self.edit_world.world.entities.push(ent);
+                let idx = self.edit_world.world.entities.len() - 1;
+                self.selected_entity = Some(idx);
+                println!("Placed playerstart #{} at ({:.0}, {:.0}, {:.0}) yaw={}",
+                    idx, cam_pos[0], cam_pos[1], cam_pos[2], yaw_attr);
+            }
+            return;
+        }
+
+        // Shift+P = delete selected entity
+        if inp.just_pressed(KeyCode::KeyP) && inp.shift && !inp.ctrl {
+            if let Some(idx) = self.selected_entity {
+                if idx < self.edit_world.world.entities.len() {
+                    let e = self.edit_world.world.entities.remove(idx);
+                    println!("Deleted entity #{} (type={}) at ({:.0}, {:.0}, {:.0})",
+                        idx, e.etype, e.pos[0], e.pos[1], e.pos[2]);
+                    self.selected_entity = None;
+                }
+            }
+            return;
+        }
+
+        // N = select nearest entity to camera
+        if inp.just_pressed(KeyCode::KeyN) && !inp.ctrl {
+            let cam = [camera.pos.x, camera.pos.z, camera.pos.y]; // renderer→cube2
+            let ents = &self.edit_world.world.entities;
+            if ents.is_empty() {
+                println!("No entities in map");
+                return;
+            }
+            // Find nearest, skipping current selection to cycle
+            let skip = self.selected_entity;
+            let mut best = None;
+            let mut best_dist = f32::MAX;
+            let mut second_best = None;
+            let mut second_dist = f32::MAX;
+            for (i, e) in ents.iter().enumerate() {
+                let dx = e.pos[0] - cam[0];
+                let dy = e.pos[1] - cam[1];
+                let dz = e.pos[2] - cam[2];
+                let d = dx*dx + dy*dy + dz*dz;
+                if d < best_dist {
+                    second_best = best;
+                    second_dist = best_dist;
+                    best = Some(i);
+                    best_dist = d;
+                } else if d < second_dist {
+                    second_best = Some(i);
+                    second_dist = d;
+                }
+            }
+            let pick = if skip == best { second_best.or(best) } else { best };
+            if let Some(idx) = pick {
+                self.selected_entity = Some(idx);
+                let e = &ents[idx];
+                let type_name = match e.etype {
+                    1 => "playerstart",
+                    2 => "light",
+                    3 => "mapmodel",
+                    7 => "envmap",
+                    _ => "unknown",
+                };
+                println!("Selected entity #{}: {} at ({:.0}, {:.0}, {:.0})",
+                    idx, type_name, e.pos[0], e.pos[1], e.pos[2]);
+            }
+            return;
+        }
     }
 
     /// Get the active selection for editing.
@@ -778,6 +882,58 @@ impl EditorState {
                 ox - bias, oy - bias, oz - bias,
                 sx + bias * 2.0, sy + bias * 2.0, sz + bias * 2.0,
                 blue);
+        }
+
+        // 3. Entity markers — show all entities as colored wireframe boxes
+        //    Playerstart = green, light = yellow, mapmodel = cyan, other = magenta
+        //    Selected entity gets a white highlight.
+        for (i, ent) in self.edit_world.world.entities.iter().enumerate() {
+            let color = match ent.etype {
+                1 => [0.0, 1.0, 0.2, 0.9],   // playerstart: green
+                2 => [1.0, 1.0, 0.0, 0.7],   // light: yellow
+                3 => [0.0, 0.8, 0.8, 0.7],   // mapmodel: cyan
+                _ => [0.7, 0.0, 0.7, 0.5],   // other: magenta
+            };
+            let sz = if ent.etype == 1 { 8.0 } else { 4.0 }; // playerstart bigger
+            // Entity pos is Cube2 Z-up (x, y, z) → push_box_3d expects Cube2 coords
+            self.push_box_3d(
+                &mut verts, &mut idxs,
+                ent.pos[0] - sz * 0.5, ent.pos[1] - sz * 0.5, ent.pos[2] - sz * 0.5,
+                sz, sz, sz,
+                color,
+            );
+
+            // Draw direction arrow for playerstart (yaw from attr[0])
+            if ent.etype == 1 {
+                let yaw_deg = ent.attr[0] as f32;
+                let yaw_rad = yaw_deg.to_radians();
+                let arrow_len = 12.0;
+                // Cube2 coords: X right, Y forward, Z up
+                let dx = yaw_rad.sin() * arrow_len;
+                let dy = yaw_rad.cos() * arrow_len;
+                let base = verts.len() as u32;
+                // Swap Y↔Z for renderer (push_box_3d does this, but for lines we do it manually)
+                verts.push(Vertex::new(
+                    [ent.pos[0], ent.pos[2], ent.pos[1]], [0.0; 3], [0.0; 2], color,
+                ));
+                verts.push(Vertex::new(
+                    [ent.pos[0] + dx, ent.pos[2], ent.pos[1] + dy], [0.0; 3], [0.0; 2], color,
+                ));
+                idxs.push(base);
+                idxs.push(base + 1);
+            }
+
+            // Highlight selected entity with white outline
+            if self.selected_entity == Some(i) {
+                let white = [1.0, 1.0, 1.0, 1.0];
+                let hs = sz + 2.0;
+                self.push_box_3d(
+                    &mut verts, &mut idxs,
+                    ent.pos[0] - hs * 0.5, ent.pos[1] - hs * 0.5, ent.pos[2] - hs * 0.5,
+                    hs, hs, hs,
+                    white,
+                );
+            }
         }
 
         (verts, idxs)

@@ -37,9 +37,9 @@ fn main() {
         .init();
 
     let map_path = std::env::args().nth(1).or_else(|| {
-        // Default map: Thor2009 by cronos (Gregor Koch), 2009
+        // Default map: two_towers by cronos (Gregor Koch)
         let default = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
-            .join("packages/base/Thor2009.ogz");
+            .join("packages/base/two_towers.ogz");
         if default.exists() {
             Some(default.display().to_string())
         } else {
@@ -113,10 +113,15 @@ fn main() {
 
     // ── Camera ────────────────────────────────────────────────────────────────
     let ws = editor.edit_world.world.world_size() as f32;
+    // Try to spawn at a playerstart entity (etype 1 in Cube2), else center of map
+    let spawn_pos = editor.edit_world.world.entities.iter()
+        .find(|e| e.etype == 1)  // ET_PLAYERSTART
+        .map(|e| glam::Vec3::new(e.pos[0], e.pos[1], e.pos[2]))
+        .unwrap_or(glam::Vec3::new(ws * 0.5, ws * 0.5, ws * 0.5));
     let mut camera = FlyCamera {
-        pos:   glam::Vec3::new(ws * 0.5, ws * 0.9, ws * 0.2),
+        pos:   spawn_pos,
         yaw:   0.0,
-        pitch: -0.8,
+        pitch: 0.0,
         speed: (ws * 0.25).max(80.0).min(4096.0),
         ..FlyCamera::default()
     };
@@ -157,6 +162,7 @@ fn main() {
     println!("Controls: E=edit mode | WASD move | mouse look (click grab, Esc release) | Scroll=speed | Shift=sprint | F=wireframe | Esc=quit");
     println!("Editor:   LMB=select face | RMB=select vertices | Scroll=fill/push | F+Scroll=edge push | G+Scroll=grid | Space=cancel | Del=delete | X=flip | R+Scroll=rotate | C=copy V=paste | Z=undo I=redo");
     println!("Texture:  1+Scroll=slot | 2+Scroll=rotate | 3+Scroll=scale | 4+Scroll=offset (Shift=2nd axis) | 5+Scroll=material");
+    println!("Entity:   P=place/move playerstart | N=select nearest entity | Shift+P=delete entity");
     println!("File:     Ctrl+S=save | Ctrl+O=open | Ctrl+N=new map | Ctrl+E=export GLB | Ctrl+Shift+E=export FBX");
 
     // ── Input + state ─────────────────────────────────────────────────────────
@@ -431,6 +437,10 @@ fn main() {
                     editor.request_export_fbx = false;
                     handle_export_fbx(&editor);
                 }
+                if editor.request_package_map {
+                    editor.request_package_map = false;
+                    handle_package_map(&editor);
+                }
 
                 inp.flush();
 
@@ -649,6 +659,11 @@ fn build_editor_ui(
                         ui.close_menu();
                     }
                     ui.separator();
+                    if ui.add(egui::Button::new("Package Map   Ctrl+P")).clicked() {
+                        editor.request_package_map = true;
+                        ui.close_menu();
+                    }
+                    ui.separator();
                     if ui.button("Quit").clicked() {
                         println!("Quit requested via menu");
                         std::process::exit(0);
@@ -695,6 +710,31 @@ fn build_editor_ui(
                     }
                     ui.separator();
                     ui.label(format!("Grid Size: {} (2^{})", editor.grid_size, editor.grid_power));
+                });
+
+                ui.menu_button("Entity", |ui| {
+                    if ui.add(egui::Button::new("Place Playerstart   P")).clicked() {
+                        println!("[menu] Place playerstart — press P in edit mode");
+                        ui.close_menu();
+                    }
+                    if ui.add(egui::Button::new("Select Nearest      N")).clicked() {
+                        println!("[menu] Select nearest — press N in edit mode");
+                        ui.close_menu();
+                    }
+                    if ui.add(egui::Button::new("Delete Selected  Shift+P")).clicked() {
+                        println!("[menu] Delete entity — press Shift+P in edit mode");
+                        ui.close_menu();
+                    }
+                    ui.separator();
+                    if ui.button("Deselect Entity").clicked() {
+                        editor.selected_entity = None;
+                        ui.close_menu();
+                    }
+                    ui.separator();
+                    let ps_count = editor.edit_world.world.entities.iter()
+                        .filter(|e| e.etype == 1).count();
+                    ui.label(format!("Playerstarts: {}", ps_count));
+                    ui.label(format!("Total entities: {}", editor.edit_world.world.entities.len()));
                 });
 
                 ui.menu_button("Texture", |ui| {
@@ -750,6 +790,23 @@ fn build_editor_ui(
                 // Texture slot info
                 let num_slots = editor.tex_registry.num_slots();
                 ui.label(format!("Slots: {}", num_slots));
+                ui.separator();
+
+                // Entity info
+                let ent_count = editor.edit_world.world.entities.len();
+                let ps_count = editor.edit_world.world.entities.iter()
+                    .filter(|e| e.etype == 1).count();
+                ui.label(format!("Ents: {} ({}ps)", ent_count, ps_count));
+                if let Some(idx) = editor.selected_entity {
+                    if idx < editor.edit_world.world.entities.len() {
+                        let e = &editor.edit_world.world.entities[idx];
+                        let name = match e.etype { 1=>"ps", 2=>"light", 3=>"model", _=>"?" };
+                        ui.colored_label(
+                            egui::Color32::from_rgb(100, 255, 100),
+                            format!("[{}#{}]", name, idx),
+                        );
+                    }
+                }
                 ui.separator();
 
                 // Mesh stats
@@ -948,6 +1005,167 @@ fn handle_export_fbx(editor: &editor::EditorState) {
             Err(e) => eprintln!("FBX export failed: {}", e),
         }
     }
+}
+
+/// Package a map into a self-contained .zip with all textures.
+/// Structure inside zip:
+///   mapname/mapname.ogz
+///   mapname/mapname.cfg        (rewritten with local paths)
+///   mapname/textures/...       (all referenced texture files)
+fn handle_package_map(editor: &editor::EditorState) {
+    let map_path = match &editor.current_map_path {
+        Some(p) => p.clone(),
+        None => {
+            eprintln!("Package: no map loaded");
+            return;
+        }
+    };
+
+    let ogz = std::path::Path::new(&map_path);
+    let map_name = ogz.file_stem()
+        .and_then(|s| s.to_str())
+        .unwrap_or("untitled")
+        .to_string();
+
+    let cfg_path = ogz.with_extension("cfg");
+    let packages_dir = ogz.parent()
+        .and_then(|p| p.parent())
+        .unwrap_or_else(|| std::path::Path::new("."));
+
+    // Collect all texture paths from the registry
+    let mut tex_files: Vec<String> = Vec::new();
+    for slot in &editor.tex_registry.slots {
+        for tex in &slot.textures {
+            if !tex.path.is_empty() {
+                tex_files.push(tex.path.clone());
+            }
+        }
+    }
+    tex_files.sort();
+    tex_files.dedup();
+
+    // Ask where to save the zip
+    let dialog = rfd::FileDialog::new()
+        .set_title("Package Map")
+        .set_file_name(&format!("{}.zip", map_name))
+        .add_filter("ZIP Archive", &["zip"]);
+
+    let zip_path = match dialog.save_file() {
+        Some(p) => p,
+        None => return,
+    };
+
+    // Build the zip
+    let file = match std::fs::File::create(&zip_path) {
+        Ok(f) => f,
+        Err(e) => {
+            eprintln!("Failed to create zip: {}", e);
+            return;
+        }
+    };
+    let mut zip = zip::ZipWriter::new(file);
+    let options = zip::write::FileOptions::default()
+        .compression_method(zip::CompressionMethod::Deflated);
+
+    // Add the .ogz
+    let ogz_data = match std::fs::read(ogz) {
+        Ok(d) => d,
+        Err(e) => {
+            eprintln!("Failed to read map file: {}", e);
+            return;
+        }
+    };
+    let _ = zip.start_file(format!("{}/{}.ogz", map_name, map_name), options);
+    let _ = std::io::Write::write_all(&mut zip, &ogz_data);
+
+    // Build a new .cfg with portable paths and add textures
+    let mut new_cfg = String::new();
+    let mut copied = 0u32;
+    let mut missing = 0u32;
+
+    // Read original cfg to preserve shader/texrotate/texscale etc.
+    if cfg_path.exists() {
+        let cfg_text = parse_cfg_with_exec(&cfg_path, packages_dir);
+        for line in cfg_text.lines() {
+            let trimmed = line.trim();
+            let parts: Vec<&str> = trimmed.split_whitespace().collect();
+
+            if parts.first() == Some(&"texture") && parts.len() >= 3 {
+                // Rewrite texture path to be relative inside the zip
+                let tex_type = parts[1];
+                let orig_path = parts[2].trim_matches('"');
+
+                // Copy the texture file into the zip
+                let full_path = packages_dir.join(orig_path);
+                // Use just the filename for the portable path
+                let file_name = std::path::Path::new(orig_path)
+                    .file_name()
+                    .and_then(|s| s.to_str())
+                    .unwrap_or(orig_path);
+                let zip_tex_path = format!("{}/textures/{}", map_name, file_name);
+
+                if full_path.exists() {
+                    if let Ok(data) = std::fs::read(&full_path) {
+                        let _ = zip.start_file(&zip_tex_path, options);
+                        let _ = std::io::Write::write_all(&mut zip, &data);
+                        copied += 1;
+                    }
+                } else {
+                    // Try common extensions
+                    let found = try_find_texture(&full_path, packages_dir);
+                    if let Some(found_path) = found {
+                        if let Ok(data) = std::fs::read(&found_path) {
+                            let actual_name = found_path.file_name()
+                                .and_then(|s| s.to_str())
+                                .unwrap_or(file_name);
+                            let zip_tex_path = format!("{}/textures/{}", map_name, actual_name);
+                            let _ = zip.start_file(&zip_tex_path, options);
+                            let _ = std::io::Write::write_all(&mut zip, &data);
+                            copied += 1;
+                        }
+                    } else {
+                        eprintln!("  texture not found: {}", full_path.display());
+                        missing += 1;
+                    }
+                }
+
+                // Write rewritten texture line with portable path
+                new_cfg.push_str(&format!("texture {} \"textures/{}\"\n", tex_type, file_name));
+            } else {
+                // Pass through all other lines (shader, texrotate, etc.)
+                new_cfg.push_str(line);
+                new_cfg.push('\n');
+            }
+        }
+    }
+
+    // Add the rewritten .cfg
+    let _ = zip.start_file(format!("{}/{}.cfg", map_name, map_name), options);
+    let _ = std::io::Write::write_all(&mut zip, new_cfg.as_bytes());
+
+    // Finalize
+    match zip.finish() {
+        Ok(_) => {
+            println!("Packaged map: {} ({} textures copied, {} missing) → {}",
+                map_name, copied, missing, zip_path.display());
+        }
+        Err(e) => eprintln!("Failed to finalize zip: {}", e),
+    }
+}
+
+/// Try to find a texture file by trying common extensions.
+fn try_find_texture(path: &std::path::Path, _packages_dir: &std::path::Path) -> Option<std::path::PathBuf> {
+    // Try the path as-is first
+    if path.exists() { return Some(path.to_path_buf()); }
+
+    // Try with common image extensions
+    let stem = path.with_extension("");
+    for ext in &["jpg", "jpeg", "png", "tga", "bmp", "dds"] {
+        let p = stem.with_extension(ext);
+        if p.exists() { return Some(p); }
+    }
+
+    None
 }
 
 /// Load map textures from the .cfg file alongside the .ogz.

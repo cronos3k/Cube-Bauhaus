@@ -22,3 +22,9 @@ screenshot_*.png
 
 # Claude session data
 .claude/
+
+# Map packages — hosted on gamedev.tech, not in git
+/packages/
+
+# Temp zip files
+*.zip

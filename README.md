@@ -57,18 +57,38 @@ cargo build --release
 ## Usage
 
 ```bash
-# Launch with the included Thor2009 map (default)
-cube-bauhaus
-
-# Load any Sauerbraten map
+# Load a Sauerbraten map
 cube-bauhaus path/to/map.ogz
+
+# Start with empty map
+cube-bauhaus
 ```
 
-### Default Map: Thor2009
+## Downloads
+
+Maps and texture packs are hosted separately — **not included in this repo**.
+
+Download from **[gamedev.tech/downloads/cube-bauhaus](https://gamedev.tech/downloads/cube-bauhaus/)**:
+
+| Pack | Contents | Size |
+|------|----------|------|
+| **Maps Pack** | All BananaBread maps + Thor2009 (OGZ + .cfg) | 32 MB |
+| **GK Texture Packs** | cyber, fantasy, future, lava, dds | 129 MB |
+
+Extract into a `packages/` directory next to the executable:
+```
+cube-bauhaus/
+  cube-bauhaus.exe
+  packages/
+    base/          ← maps (.ogz + .cfg)
+    gk/            ← texture packs
+```
+
+### Thor2009
 
 ![Thor2009](docs/thor2009_preview.jpg)
 
-Cube Bauhaus ships with **Thor2009** by cronos (Gregor Koch, 2009) — an industrial underwater environment originally created for Sauerbraten and published on [Quadropolis](https://quadropolis.github.io/). Complete with custom textures, normal maps, specular maps, and architectural model kit.
+**Thor2009** by cronos (Gregor Koch, 2009) — an industrial underwater environment originally created for Sauerbraten and published on [Quadropolis](https://quadropolis.github.io/). Complete with custom textures, normal maps, specular maps, and architectural model kit.
 
 ## Architecture
 
