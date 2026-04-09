@@ -80,8 +80,12 @@ impl FlyCamera {
     }
 
     /// Apply mouse delta (in pixels) when mouse look is active.
+    /// Clamps per-frame delta to avoid wild spinning from touchpads.
     pub fn apply_mouse(&mut self, dx: f32, dy: f32) {
         const SENSITIVITY: f32 = 0.002;
+        const MAX_DELTA: f32 = 150.0; // max pixels per frame — prevents touchpad spikes
+        let dx = dx.clamp(-MAX_DELTA, MAX_DELTA);
+        let dy = dy.clamp(-MAX_DELTA, MAX_DELTA);
         self.yaw   -= dx * SENSITIVITY;
         self.pitch -= dy * SENSITIVITY;
         self.pitch  = self.pitch.clamp(-1.553, 1.553); // ±89°

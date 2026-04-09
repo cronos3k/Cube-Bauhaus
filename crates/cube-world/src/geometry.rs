@@ -8,7 +8,7 @@
 //! winding, so we emit indices in reversed order to keep front faces correct.
 
 use glam::Vec3;
-use crate::octree::{OctreeWorld, Cube, FACE_DIM, FACEEDGESIDX, F_SOLID, R, C};
+use crate::octree::{OctreeWorld, Cube, FACE_DIM, FACEEDGESIDX, F_SOLID};
 use crate::texture::{TextureRegistry, calc_texgen, apply_texgen};
 
 /// A single vertex produced by the mesh builder.
@@ -110,261 +110,13 @@ const NOTOUCHMASKS: [[u8; 16]; 2] = [
     [3, 3, 3, 3, 3, 3, 3, 3, 3, 3, 3, 1, 3, 3, 2, 0],
 ];
 
-// ── 2D face-plane polygon types and occlusion helpers ────────────────────────
-// Port of Cube2's facevec / genfacevecs / insideface / occludesface from octa.cpp.
-
-/// 2D integer vector in the face plane (matches Cube2 `facevec`).
-#[derive(Clone, Copy, PartialEq, Eq, Debug)]
-struct FaceVec {
-    x: i32,
-    y: i32,
-}
-
-/// Project the face vertices of `cube` at orientation `orient` into the 2D face
-/// plane, producing up to 4 `FaceVec`s.  Returns the number of valid vertices.
-///
-/// Port of Cube2 `genfacevecs(cube, orient, pos, size, solid, fvecs, v)`.
-/// The 2D axes are C[dim] → x, R[dim] → y (matching the C++ convention).
-/// Coordinates are in "world×8" units: `vertex_component * size + pos_component << 3`.
-fn genfacevecs_2d(
-    cube: &Cube,
-    orient: usize,
-    pos: [i32; 3],
-    size: i32,
-    solid: bool,
-    fvecs: &mut [FaceVec; 4],
-) -> usize {
-    let dim = orient >> 1;
-    let coord = orient & 1;
-    let ca = C[dim]; // column axis index
-    let ra = R[dim]; // row axis index
-
-    if solid {
-        // Solid cube: vertices are the full face rectangle.
-        // Match C++ `GENFACEVERTS(pos.x, pos.x+size, ...)` solid branch.
-        let c0 = pos[ca] << 3;
-        let c1 = (pos[ca] + size) << 3;
-        let r0 = pos[ra] << 3;
-        let r1 = (pos[ra] + size) << 3;
-        // Vertex order depends on orient (matches C++ GENFACEORIENT dimcoord branch).
-        // For dimcoord=1: v0,v1,v2,v3 in one order; dimcoord=0: reversed.
-        if coord != 0 {
-            // dimcoord=1: (c1,r1), (c0,r1), (c0,r0), (c1,r0)
-            fvecs[0] = FaceVec { x: c1, y: r1 };
-            fvecs[1] = FaceVec { x: c0, y: r1 };
-            fvecs[2] = FaceVec { x: c0, y: r0 };
-            fvecs[3] = FaceVec { x: c1, y: r0 };
-        } else {
-            // dimcoord=0: (c1,r0), (c0,r0), (c0,r1), (c1,r1)
-            fvecs[0] = FaceVec { x: c1, y: r0 };
-            fvecs[1] = FaceVec { x: c0, y: r0 };
-            fvecs[2] = FaceVec { x: c0, y: r1 };
-            fvecs[3] = FaceVec { x: c1, y: r1 };
-        }
-        return 4;
-    }
-
-    // Non-solid: project each of the 4 face corners.
-    // Use genfaceverts to get 3D corners (0–8), then project to 2D.
-    let v3d = genfaceverts(cube, orient);
-
-    let mut count = 0usize;
-    let sentinel = FaceVec { x: i32::MAX, y: i32::MAX };
-    let mut prev = sentinel;
-
-    for vi in 0..4 {
-        let e = v3d[vi];
-        // The depth component must touch the face boundary
-        if e[dim as usize] != (coord as i32) * 8 {
-            continue;
-        }
-        let f = FaceVec {
-            x: e[ca] as i32 * size + (pos[ca] << 3),
-            y: e[ra] as i32 * size + (pos[ra] << 3),
-        };
-        if f != prev {
-            fvecs[count] = f;
-            prev = f;
-            count += 1;
-        }
-    }
-    // Deduplicate wrap-around (first == last)
-    if count > 0 && fvecs[0] == prev {
-        count -= 1;
-    }
-    count
-}
-
-/// Port of Cube2 `insideface()` — test if polygon `p` (nump vertices) is entirely
-/// inside polygon `o` (numo vertices) using 2D half-plane tests.
-///
-/// Each edge of `o` defines a half-plane; every vertex of `p` must be on the
-/// inside (≤ offset) of ALL edges.  Returns true only if `o` has ≥ 3 edges
-/// and all tests pass.
-fn insideface(p: &[FaceVec], nump: usize, o: &[FaceVec], numo: usize) -> bool {
-    let mut bounds = 0;
-    let mut prev = o[numo - 1];
-    for i in 0..numo {
-        let cur = o[i];
-        let dx = cur.x - prev.x;
-        let dy = cur.y - prev.y;
-        let offset = (dx as i64) * (prev.y as i64) - (dy as i64) * (prev.x as i64);
-        for j in 0..nump {
-            if (dx as i64) * (p[j].y as i64) - (dy as i64) * (p[j].x as i64) > offset {
-                return false;
-            }
-        }
-        bounds += 1;
-        prev = cur;
-    }
-    bounds >= 3
-}
-
-/// Port of Cube2 `clipfacevecy()`.
-fn clipfacevecy(o: &FaceVec, dir: &FaceVec, cx: i32, cy: i32, size: i32, r: &mut FaceVec) -> usize {
-    if dir.x >= 0 {
-        if cx <= o.x || cx >= o.x + dir.x { return 0; }
-    } else if cx <= o.x + dir.x || cx >= o.x {
-        return 0;
-    }
-    let t = (o.y - cy) + (cx - o.x) * dir.y / dir.x;
-    if t <= 0 || t >= size { return 0; }
-    r.x = cx;
-    r.y = cy + t;
-    1
-}
-
-/// Port of Cube2 `clipfacevecx()`.
-fn clipfacevecx(o: &FaceVec, dir: &FaceVec, cx: i32, cy: i32, size: i32, r: &mut FaceVec) -> usize {
-    if dir.y >= 0 {
-        if cy <= o.y || cy >= o.y + dir.y { return 0; }
-    } else if cy <= o.y + dir.y || cy >= o.y {
-        return 0;
-    }
-    let t = (o.x - cx) + (cy - o.y) * dir.x / dir.y;
-    if t <= 0 || t >= size { return 0; }
-    r.x = cx + t;
-    r.y = cy;
-    1
-}
-
-/// Port of Cube2 `clipfacevec()`.
-fn clipfacevec(o: &FaceVec, dir: &FaceVec, cx: i32, cy: i32, size: i32, rvecs: &mut [FaceVec]) -> usize {
-    let mut r = 0usize;
-    if o.x >= cx && o.x <= cx + size
-        && o.y >= cy && o.y <= cy + size
-        && ((o.x != cx && o.x != cx + size) || (o.y != cy && o.y != cy + size))
-    {
-        rvecs[0] = *o;
-        r += 1;
-    }
-    r += clipfacevecx(o, dir, cx, cy, size, &mut rvecs[r]);
-    r += clipfacevecx(o, dir, cx, cy + size, size, &mut rvecs[r]);
-    r += clipfacevecy(o, dir, cx, cy, size, &mut rvecs[r]);
-    r += clipfacevecy(o, dir, cx + size, cy, size, &mut rvecs[r]);
-    debug_assert!(r <= 2);
-    r
-}
-
-/// Port of Cube2 `clipfacevecs()` — clip polygon `o` against the axis-aligned
-/// rectangle at (cx, cy) with given size (all in cube-local units, scaled <<3).
-fn clipfacevecs(o: &[FaceVec], numo: usize, cx: i32, cy: i32, size: i32, rvecs: &mut [FaceVec; 8]) -> usize {
-    let cx = cx << 3;
-    let cy = cy << 3;
-    let size = size << 3;
-
-    let mut r = 0usize;
-    let mut prev = o[numo - 1];
-    for i in 0..numo {
-        let cur = o[i];
-        let dir = FaceVec { x: cur.x - prev.x, y: cur.y - prev.y };
-        r += clipfacevec(&prev, &dir, cx, cy, size, &mut rvecs[r..]);
-        prev = cur;
-    }
-    // Check if rectangle corners are inside the polygon
-    let corners = [
-        FaceVec { x: cx, y: cy },
-        FaceVec { x: cx + size, y: cy },
-        FaceVec { x: cx + size, y: cy + size },
-        FaceVec { x: cx, y: cy + size },
-    ];
-    for corner in &corners {
-        if insideface(std::slice::from_ref(corner), 1, o, numo) {
-            rvecs[r] = *corner;
-            r += 1;
-        }
-    }
-    debug_assert!(r <= 8);
-    r
-}
-
-/// Port of Cube2 `occludesface()` — recursively check if cube `c` (neighbor)
-/// fully occludes the face polygon `vf` (numv vertices in 2D face-plane coords).
-///
-/// `orient` is the orientation from the NEIGHBOR's perspective (opposite of the
-/// original face).  `o` is the neighbor origin, `size` is the neighbor size.
-fn occludesface(
-    c: &Cube,
-    orient: usize,
-    o: [i32; 3],
-    size: i32,
-    vf: &[FaceVec],
-    numv: usize,
-) -> bool {
-    let dim = orient >> 1;
-    let coord = orient & 1;
-
-    if c.children.is_none() {
-        // Leaf node
-        if c.is_solid() {
-            return true;
-        }
-        if c.touching_face(orient) && c.face_edges(orient) == F_SOLID {
-            return true;
-        }
-        // Clip the source polygon against this leaf's rectangle in the face plane.
-        let mut cf = [FaceVec { x: 0, y: 0 }; 8];
-        let numc = clipfacevecs(vf, numv, o[C[dim]], o[R[dim]], size, &mut cf);
-        if numc < 3 {
-            return true; // degenerate clipped polygon → fully covered
-        }
-        if c.is_empty() || c.not_touching_face(orient) {
-            return false;
-        }
-        // Generate the neighbor's face polygon and test containment
-        let mut of = [FaceVec { x: 0, y: 0 }; 4];
-        let numo = genfacevecs_2d(c, orient, o, size, false, &mut of);
-        return numo >= 3 && insideface(&cf[..numc], numc, &of[..numo], numo);
-    }
-
-    // Branch node: recurse into the 4 children on the shared face.
-    let half = size >> 1;
-    let children = c.children.as_ref().unwrap();
-    for i in 0..8u8 {
-        // octacoord(dim, i) = (i >> dim) & 1
-        if ((i >> dim) & 1) == coord as u8 {
-            // Compute child origin: ivec(i, o.x, o.y, o.z, size)
-            // In C++: ivec(i, ox, oy, oz, size) = (ox + (i&1)*size, oy + ((i>>1)&1)*size, oz + ((i>>2)&1)*size)
-            let co = [
-                o[0] + ((i & 1) as i32) * half,
-                o[1] + (((i >> 1) & 1) as i32) * half,
-                o[2] + (((i >> 2) & 1) as i32) * half,
-            ];
-            if !occludesface(&children[i as usize], orient, co, half, vf, numv) {
-                return false;
-            }
-        }
-    }
-    true
-}
-
 /// Port of Cube2 `visibletris()` — returns visibility bitmask:
 ///   bit 0 = triangle 1 visible
 ///   bit 1 = triangle 2 visible
 ///   bit 2 = order flip (use order=1)
 ///
-/// Full port including insideface/occludesface neighbor occlusion and the
-/// per-triangle retry loop (C++ lines 1061–1149).
+/// Does NOT do full insideface/occludesface neighbor occlusion — uses simplified
+/// neighbor check (conservative: shows face when unsure).
 fn visibletris(
     cube: &Cube,
     orient: usize,
@@ -409,10 +161,11 @@ fn visibletris(
     if v[2][dim] != target { touching &= !(1u8 << 2); }
     if v[3][dim] != target { touching &= !(1u8 << 3); }
 
-    let mut order: usize = if convex < 0 { 1 } else { 0 };
+    let order: usize = if convex < 0 { 1 } else { 0 };
     let notouch = NOTOUCHMASKS[order][touching as usize];
 
     // If all visible triangles are "not touching", they're interior faces — always visible.
+    // C++ line 1120: returns vis WITHOUT bit 2.
     if (vis & notouch) == vis {
         return vis;
     }
@@ -431,88 +184,31 @@ fn visibletris(
     let ny = oy + nd[1] * size;
     let nz = oz + nd[2] * size;
 
-    // Outside world → face is at world boundary, not visible
+    // Outside world → not visible
     if nx < 0 || nx >= ws || ny < 0 || ny >= ws || nz < 0 || nz >= ws {
         return 0;
     }
 
-    let (neighbor, norigin, nsize) = world.lookup(nx, ny, nz);
+    let (neighbor, _norigin, nsize) = world.lookup(nx, ny, nz);
     let opp = orient ^ 1;
 
-    // Mask origins to 12 bits (matching C++ vo.mask(0xFFF) / no.mask(0xFFF))
-    let vo = [ox & 0xFFF, oy & 0xFFF, oz & 0xFFF];
-    let no = [norigin.0 & 0xFFF, norigin.1 & 0xFFF, norigin.2 & 0xFFF];
-
-    // Generate the source face polygon in 2D face-plane coordinates
-    let mut cf = [FaceVec { x: 0, y: 0 }; 4];
-    let mut of = [FaceVec { x: 0, y: 0 }; 4];
-    let mut numo: usize = 0;
-    let numc: usize;
-
-    if nsize > size || (nsize == size && neighbor.children.is_none()) {
-        // Same-size or larger neighbor leaf
+    if nsize >= size && neighbor.children.is_none() {
         if neighbor.is_empty() || neighbor.not_touching_face(opp) {
+            // C++ line 1135: returns vis WITHOUT bit 2
             return vis;
         }
         if neighbor.is_solid() || (neighbor.touching_face(opp) && neighbor.face_edges(opp) == F_SOLID) {
+            // C++ line 1137: returns vis&notouch WITHOUT bit 2
             return vis & notouch;
         }
-
-        numc = genfacevecs_2d(cube, orient, vo, size, false, &mut cf);
-        numo = genfacevecs_2d(neighbor, opp, no, nsize, false, &mut of);
-        if numo < 3 { return vis; }
-        if insideface(&cf[..numc], numc, &of[..numo], numo) {
-            return vis & notouch;
-        }
-    } else {
-        // Smaller neighbor (has children) — use occludesface
-        numc = genfacevecs_2d(cube, orient, vo, size, false, &mut cf);
-        if occludesface(neighbor, opp, no, nsize, &cf[..numc], numc) {
-            return vis & notouch;
-        }
+        // C++ line 1142: returns vis WITHOUT bit 2
+        return vis;
     }
 
-    // ── Per-triangle retry loop (C++ lines 1121–1148) ──
-    // If the whole face isn't occluded, check individual triangles.
-    if vis != 3 || notouch != 0 { return vis; }
-
-    // C++ triverts[order][coord][tri_index][vert] — which of the 4 cf[] vertices
-    // form each triangle, indexed by [order][coord][triangle].
-    const TRIVERTS: [[[[usize; 3]; 2]; 2]; 2] = [
-        // order 0
-        [
-            // coord 0
-            [ [1, 2, 3], [0, 1, 3] ],
-            // coord 1
-            [ [0, 1, 2], [0, 2, 3] ],
-        ],
-        // order 1
-        [
-            // coord 0
-            [ [0, 1, 2], [3, 0, 2] ],
-            // coord 1
-            [ [1, 2, 3], [1, 3, 0] ],
-        ],
-    ];
-
-    loop {
-        for i in 0..2usize {
-            let verts = &TRIVERTS[order][coord][i];
-            let tf = [cf[verts[0]], cf[verts[1]], cf[verts[2]]];
-            let occluded = if numo > 0 {
-                insideface(&tf, 3, &of[..numo], numo)
-            } else {
-                occludesface(neighbor, opp, no, nsize, &tf, 3)
-            };
-            if !occluded { continue; }
-            return vis & !(1u8 << i);
-        }
-        vis |= 4;
-        order += 1;
-        if order > 1 { break; }
-    }
-
-    3
+    // Smaller neighbors — conservative: show the face.
+    // Bit 2 (order flip) is ONLY set in C++'s retry loop (line 1173),
+    // which we don't implement. So never set it here.
+    vis
 }
 
 /// Build a renderable triangle mesh from the entire world.
