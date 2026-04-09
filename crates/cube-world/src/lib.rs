@@ -32,4 +32,4 @@ pub use texture::{
     VSLOT_SCROLL, VSLOT_LAYER, VSLOT_ALPHA, VSLOT_COLOR,
     calc_texgen, apply_texgen, load_texture_config,
 };
-pub use export::{export_glb, export_fbx, optimize_mesh};
+pub use export::{export_glb, export_fbx, export_fbx_unreal, optimize_mesh};

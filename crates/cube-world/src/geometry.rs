@@ -306,20 +306,29 @@ pub fn build_mesh_with_textures(
                 (sgen, tgen)
             };
 
-            // Build vertex color: rgb = tint, a = texture layer index (or -1 if no textures)
-            let color = if let Some(reg) = registry {
-                let vs = reg.lookup_vslot(tex_idx);
-                let slot = reg.slot_for_vslot(vs);
-                if slot.loaded {
-                    // Real texture: white tint * VSlot color_scale, layer = diffuse layer
-                    let layer = slot.textures.first().map_or(0, |t| t.layer) as f32;
-                    [vs.color_scale[0], vs.color_scale[1], vs.color_scale[2], layer]
-                } else {
-                    // Slot exists but not loaded — debug color, no texture sampling
-                    face_debug_color(orient, tex_idx)
+            // Build vertex color: rgb = tint, a = texture layer index (or special material code)
+            // Material codes (negative alpha): -2=glass, -3=water, -4=lava, -5=clip
+            use crate::octree::{MAT_WATER, MAT_LAVA, MAT_GLASS, MAT_CLIP};
+            let color = match cube.material {
+                MAT_GLASS => [0.6, 0.8, 1.0, -2.0],  // light blue tint
+                MAT_WATER => [0.2, 0.4, 0.9, -3.0],  // blue tint
+                MAT_LAVA  => [1.0, 0.4, 0.1, -4.0],  // orange tint
+                MAT_CLIP  => [1.0, 0.2, 0.2, -5.0],  // red tint
+                _ => {
+                    // Normal solid geometry
+                    if let Some(reg) = registry {
+                        let vs = reg.lookup_vslot(tex_idx);
+                        let slot = reg.slot_for_vslot(vs);
+                        if slot.loaded {
+                            let layer = slot.textures.first().map_or(0, |t| t.layer) as f32;
+                            [vs.color_scale[0], vs.color_scale[1], vs.color_scale[2], layer]
+                        } else {
+                            face_debug_color(orient, tex_idx)
+                        }
+                    } else {
+                        face_debug_color(orient, tex_idx)
+                    }
                 }
-            } else {
-                face_debug_color(orient, tex_idx)
             };
 
             // Emit vertices

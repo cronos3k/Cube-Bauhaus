@@ -104,6 +104,7 @@ pub struct EditorState {
     pub request_newmap: bool,
     pub request_export_glb: bool,
     pub request_export_fbx: bool,
+    pub export_unreal_collision: bool,  // checkbox: include UBX_ collision for Unreal
     pub request_package_map: bool,
     pub current_map_path: Option<String>,
     pub packages_dir: Option<String>,
@@ -135,6 +136,7 @@ impl EditorState {
             request_newmap: false,
             request_export_glb: false,
             request_export_fbx: false,
+            export_unreal_collision: false,
             request_package_map: false,
             current_map_path: None,
             packages_dir: None,

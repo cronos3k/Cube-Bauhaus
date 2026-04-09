@@ -22,10 +22,21 @@ void main() {
     vec3 l = normalize(cam.sun_dir.xyz);
 
     // Texture layer index is packed in color.a
+    // Special material codes: -2=glass, -3=water, -4=lava, -5=clip
     float layer = frag_color.a;
     vec3 base_color;
+    bool is_material = (layer <= -1.5);
 
-    if (layer >= 0.0) {
+    // Dither discard for material volumes (glass, water, lava, clip)
+    // Screen-space checkerboard — discards 50% of pixels for see-through effect
+    if (is_material) {
+        ivec2 px = ivec2(gl_FragCoord.xy);
+        int pattern = (px.x + px.y) % 2;
+        if (pattern == 0) discard;
+
+        // Use the tint color directly for materials
+        base_color = frag_color.rgb;
+    } else if (layer >= 0.0) {
         // Sample from texture array
         vec3 tex_coord = vec3(frag_uv, layer);
         vec3 tex_color = texture(tex_array, tex_coord).rgb;

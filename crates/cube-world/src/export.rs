@@ -138,8 +138,9 @@ pub fn export_glb(
     // ── 2. Group triangles by texture slot ───────────────────────────────
     // The texture slot is encoded in `color.a`:
     //   >= 0.0  → valid layer index (cast to usize)
-    //   < 0.0   → no texture loaded (debug colour)
-    // We use i32 as the key: -1 for untextured, otherwise the layer index.
+    //   < 0.0   → material volume (-2=glass, -3=water, -4=lava, -5=clip)
+    //             or -1 for untextured debug color
+    // We use i32 as the key, preserving distinct material codes.
 
     struct PrimGroup {
         slot_key: i32,
@@ -153,7 +154,7 @@ pub fn export_glb(
     for t in 0..tri_count {
         let vi = indices[t * 3] as usize;
         let layer = verts[vi].color[3];
-        let key = if layer < 0.0 { -1 } else { layer.round() as i32 };
+        let key = if layer >= 0.0 { layer.round() as i32 } else { layer.round() as i32 };
 
         let g = group_map.entry(key).or_insert_with(|| {
             let idx = groups.len();
@@ -163,6 +164,55 @@ pub fn export_glb(
         groups[*g].indices.push(indices[t * 3]);
         groups[*g].indices.push(indices[t * 3 + 1]);
         groups[*g].indices.push(indices[t * 3 + 2]);
+    }
+
+    // ── 2b. Remove sky-slot geometry (slot 0 / layer 0) ────────────────
+    groups.retain(|g| g.slot_key != 0);
+
+    // ── 2c. Separate material volumes into their own files ─────────────
+    let mut mat_groups: Vec<PrimGroup> = Vec::new();
+    let mut solid_groups: Vec<PrimGroup> = Vec::new();
+    for g in groups {
+        if g.slot_key <= -2 {
+            mat_groups.push(g);
+        } else {
+            solid_groups.push(g);
+        }
+    }
+    let groups = solid_groups;
+    if !mat_groups.is_empty() {
+        let base = std::path::Path::new(path);
+        let stem = base.file_stem().and_then(|s| s.to_str()).unwrap_or("export");
+        let ext = base.extension().and_then(|s| s.to_str()).unwrap_or("glb");
+        let dir = base.parent().unwrap_or(std::path::Path::new("."));
+        for mg in &mat_groups {
+            let mat_name = match mg.slot_key {
+                -2 => "glass",
+                -3 => "water",
+                -4 => "lava",
+                -5 => "clip",
+                _  => "material",
+            };
+            let mat_path = dir.join(format!("{}_{}.{}", stem, mat_name, ext));
+            eprintln!("  Material volume: {} → {} ({} tris)",
+                mat_name, mat_path.display(), mg.indices.len() / 3);
+            let mat_color: [f32; 4] = match mg.slot_key {
+                -2 => [0.6, 0.8, 1.0, 0.5],  // glass: light blue, semi-transparent
+                -3 => [0.2, 0.4, 0.9, 0.5],  // water: blue
+                -4 => [1.0, 0.4, 0.1, 0.8],  // lava: orange
+                -5 => [1.0, 0.2, 0.2, 0.3],  // clip: red, mostly transparent
+                _  => [0.5, 0.5, 0.5, 0.5],
+            };
+            if let Err(e) = write_material_volume_glb(
+                &mat_path.to_string_lossy(), &verts, &mg.indices, mat_color
+            ) {
+                eprintln!("  Warning: failed to write {}: {}", mat_name, e);
+            }
+        }
+    }
+
+    if groups.is_empty() {
+        return Err("All geometry is sky or material — nothing to export.".into());
     }
 
     // ── 3. Collect texture image data ────────────────────────────────────
@@ -595,6 +645,148 @@ fn io_err(e: std::io::Error) -> String {
     format!("I/O error writing GLB: {}", e)
 }
 
+/// Write a single material volume as a minimal GLB file.
+///
+/// The mesh contains only position and normal attributes with a single flat-color
+/// PBR material. Alpha < 1.0 uses `BLEND` mode so the volume appears semi-transparent
+/// in standard glTF viewers.
+fn write_material_volume_glb(
+    path: &str,
+    all_verts: &[MeshVertex],
+    group_indices: &[u32],
+    color: [f32; 4],
+) -> Result<(), String> {
+    // Collect only the vertices referenced by this group
+    let mut remap: HashMap<u32, u32> = HashMap::new();
+    let mut verts: Vec<MeshVertex> = Vec::new();
+    let mut indices: Vec<u32> = Vec::new();
+
+    for &idx in group_indices {
+        let new_idx = remap.entry(idx).or_insert_with(|| {
+            let i = verts.len() as u32;
+            verts.push(all_verts[idx as usize]);
+            i
+        });
+        indices.push(*new_idx);
+    }
+
+    if verts.is_empty() || indices.is_empty() {
+        return Ok(()); // nothing to write
+    }
+
+    // Binary buffer: positions (vec3) + normals (vec3) + indices (u32)
+    let pos_byte_len = verts.len() * 12;
+    let nrm_byte_len = verts.len() * 12;
+    let idx_byte_len = indices.len() * 4;
+    let total_bin = align4(pos_byte_len) + align4(nrm_byte_len) + align4(idx_byte_len);
+
+    let mut bin = Vec::with_capacity(total_bin);
+
+    // Positions
+    let mut pos_min = [f32::MAX; 3];
+    let mut pos_max = [f32::MIN; 3];
+    for v in &verts {
+        for i in 0..3 {
+            if v.position[i] < pos_min[i] { pos_min[i] = v.position[i]; }
+            if v.position[i] > pos_max[i] { pos_max[i] = v.position[i]; }
+        }
+        bin.extend_from_slice(&v.position[0].to_le_bytes());
+        bin.extend_from_slice(&v.position[1].to_le_bytes());
+        bin.extend_from_slice(&v.position[2].to_le_bytes());
+    }
+    while bin.len() < align4(pos_byte_len) { bin.push(0); }
+
+    let nrm_offset = bin.len();
+    // Normals
+    for v in &verts {
+        bin.extend_from_slice(&v.normal[0].to_le_bytes());
+        bin.extend_from_slice(&v.normal[1].to_le_bytes());
+        bin.extend_from_slice(&v.normal[2].to_le_bytes());
+    }
+    while bin.len() < nrm_offset + align4(nrm_byte_len) { bin.push(0); }
+
+    let idx_offset = bin.len();
+    // Indices
+    let mut idx_min = u32::MAX;
+    let mut idx_max = 0u32;
+    for &i in &indices {
+        if i < idx_min { idx_min = i; }
+        if i > idx_max { idx_max = i; }
+        bin.extend_from_slice(&i.to_le_bytes());
+    }
+    while bin.len() < idx_offset + align4(idx_byte_len) { bin.push(0); }
+
+    // Alpha mode
+    let alpha_mode = if color[3] < 1.0 { r#","alphaMode":"BLEND""# } else { "" };
+
+    let json_str = format!(
+        concat!(
+            r#"{{"asset":{{"version":"2.0","generator":"BBC Cube2 Editor"}},"#,
+            r#""scene":0,"scenes":[{{"nodes":[0]}}],"nodes":[{{"mesh":0}}],"#,
+            r#""meshes":[{{"primitives":[{{"attributes":{{"POSITION":0,"NORMAL":1}},"indices":2,"material":0}}]}}],"#,
+            r#""accessors":["#,
+            r#"{{"bufferView":0,"componentType":5126,"count":{},"type":"VEC3","min":[{},{},{}],"max":[{},{},{}]}},"#,
+            r#"{{"bufferView":1,"componentType":5126,"count":{},"type":"VEC3"}},"#,
+            r#"{{"bufferView":2,"componentType":5125,"count":{},"type":"SCALAR","min":[{}],"max":[{}]}}"#,
+            r#"],"bufferViews":["#,
+            r#"{{"buffer":0,"byteOffset":0,"byteLength":{}}},"#,
+            r#"{{"buffer":0,"byteOffset":{},"byteLength":{}}},"#,
+            r#"{{"buffer":0,"byteOffset":{},"byteLength":{}}}"#,
+            r#"],"buffers":[{{"byteLength":{}}}],"#,
+            r#""materials":[{{"pbrMetallicRoughness":{{"baseColorFactor":[{},{},{},{}],"metallicFactor":0.0,"roughnessFactor":0.8}}{}}}]}}"#,
+        ),
+        verts.len(),
+        format_f32(pos_min[0]), format_f32(pos_min[1]), format_f32(pos_min[2]),
+        format_f32(pos_max[0]), format_f32(pos_max[1]), format_f32(pos_max[2]),
+        verts.len(),
+        indices.len(), idx_min, idx_max,
+        align4(pos_byte_len),
+        nrm_offset, align4(nrm_byte_len),
+        idx_offset, align4(idx_byte_len),
+        total_bin,
+        format_f32(color[0]), format_f32(color[1]), format_f32(color[2]), format_f32(color[3]),
+        alpha_mode,
+    );
+
+    // Write GLB
+    let json_bytes = json_str.as_bytes();
+    let json_padded = align4(json_bytes.len());
+    let total_length = 12 + 8 + json_padded + 8 + total_bin;
+
+    let out_path = Path::new(path);
+    if let Some(parent) = out_path.parent() {
+        if !parent.exists() {
+            std::fs::create_dir_all(parent)
+                .map_err(|e| format!("Failed to create dir: {}", e))?;
+        }
+    }
+
+    let file = std::fs::File::create(out_path)
+        .map_err(|e| format!("Failed to create '{}': {}", path, e))?;
+    let mut w = std::io::BufWriter::new(file);
+
+    w.write_all(&GLB_MAGIC.to_le_bytes()).map_err(io_err)?;
+    w.write_all(&2u32.to_le_bytes()).map_err(io_err)?;
+    w.write_all(&(total_length as u32).to_le_bytes()).map_err(io_err)?;
+
+    w.write_all(&(json_padded as u32).to_le_bytes()).map_err(io_err)?;
+    w.write_all(&CHUNK_JSON.to_le_bytes()).map_err(io_err)?;
+    w.write_all(json_bytes).map_err(io_err)?;
+    if json_padded > json_bytes.len() {
+        w.write_all(&vec![0x20u8; json_padded - json_bytes.len()]).map_err(io_err)?;
+    }
+
+    w.write_all(&(total_bin as u32).to_le_bytes()).map_err(io_err)?;
+    w.write_all(&CHUNK_BIN.to_le_bytes()).map_err(io_err)?;
+    w.write_all(&bin).map_err(io_err)?;
+
+    w.flush().map_err(io_err)?;
+
+    eprintln!("  ✓ Wrote material volume: {} ({} verts, {} tris)",
+        path, verts.len(), indices.len() / 3);
+    Ok(())
+}
+
 /// Guess MIME type from a file path extension.
 fn guess_image_mime(path: &str) -> &'static str {
     let lower = path.to_ascii_lowercase();
@@ -639,11 +831,121 @@ fn try_alternative_paths(original: &Path) -> Vec<std::path::PathBuf> {
 /// The FBX ASCII format is verbose but universally supported and much simpler
 /// to emit than the binary format.  For very large meshes the resulting file
 /// can be large; use GLB for more compact output.
+/// A box collision primitive for Unreal Engine export.
+/// Represents an axis-aligned box with 8 vertices.
+struct CollisionBox {
+    /// 8 corners of the box in renderer coords (Y-up, already swapped from Cube2 Z-up)
+    corners: [[f32; 3]; 8],
+}
+
+/// Generate UBX collision boxes from the octree.
+/// Each solid non-empty leaf cube becomes one collision box.
+/// Returns boxes in renderer coordinate space (Y-up, Y↔Z swapped).
+fn generate_collision_boxes(world: &OctreeWorld) -> Vec<CollisionBox> {
+    let mut boxes = Vec::new();
+
+    world.for_each_leaf(|cube, (ox, oy, oz), size| {
+        // Skip empty cubes
+        if cube.is_empty() { return; }
+        // Include normal solids (MAT_AIR=0x00), alpha (0x80), and clip (0x20) as collision
+        // Skip water (0x04), lava (0x08), glass (0x10) — they're passable
+        let m = cube.material;
+        if m == 0x04 || m == 0x08 || m == 0x10 {
+            return;
+        }
+
+        let s = size as f32;
+        let fx = ox as f32;
+        let fy = oy as f32;
+        let fz = oz as f32;
+
+        // For solid cubes (all edges at 0x88), the box is exact: [ox..ox+size] in each dim.
+        // For deformed cubes, compute the tight AABB of the actual corner positions.
+        if cube.is_solid() {
+            // Cube2 coords: (x, y, z) → renderer: (x, z, y) [Y↔Z swap]
+            let corners = [
+                [fx,     fz,     fy    ],  // 0: (0,0,0)
+                [fx + s, fz,     fy    ],  // 1: (1,0,0)
+                [fx,     fz,     fy + s],  // 2: (0,1,0)
+                [fx + s, fz,     fy + s],  // 3: (1,1,0)
+                [fx,     fz + s, fy    ],  // 4: (0,0,1)
+                [fx + s, fz + s, fy    ],  // 5: (1,0,1)
+                [fx,     fz + s, fy + s],  // 6: (0,1,1)
+                [fx + s, fz + s, fy + s],  // 7: (1,1,1)
+            ];
+            boxes.push(CollisionBox { corners });
+        } else {
+            // Deformed cube: compute AABB from actual corner positions
+            let mut min = [f32::MAX; 3];
+            let mut max = [f32::MIN; 3];
+
+            for ci in 0..8 {
+                let c = cube.corner(ci);
+                // Local coords 0-8 → world space, then Y↔Z swap
+                let wx = fx + c[0] as f32 * s / 8.0;
+                let wy = fy + c[1] as f32 * s / 8.0;
+                let wz = fz + c[2] as f32 * s / 8.0;
+                // Renderer coords: (wx, wz, wy)
+                let rx = wx;
+                let ry = wz;
+                let rz = wy;
+                if rx < min[0] { min[0] = rx; }
+                if ry < min[1] { min[1] = ry; }
+                if rz < min[2] { min[2] = rz; }
+                if rx > max[0] { max[0] = rx; }
+                if ry > max[1] { max[1] = ry; }
+                if rz > max[2] { max[2] = rz; }
+            }
+
+            // Skip zero-volume boxes
+            if (max[0] - min[0]).abs() < 0.001
+                || (max[1] - min[1]).abs() < 0.001
+                || (max[2] - min[2]).abs() < 0.001 {
+                return;
+            }
+
+            let corners = [
+                [min[0], min[1], min[2]],
+                [max[0], min[1], min[2]],
+                [min[0], min[1], max[2]],
+                [max[0], min[1], max[2]],
+                [min[0], max[1], min[2]],
+                [max[0], max[1], min[2]],
+                [min[0], max[1], max[2]],
+                [max[0], max[1], max[2]],
+            ];
+            boxes.push(CollisionBox { corners });
+        }
+    });
+
+    boxes
+}
+
 pub fn export_fbx(
     path: &str,
     world: &OctreeWorld,
     registry: Option<&TextureRegistry>,
     texture_base_path: Option<&str>,
+) -> Result<(), String> {
+    export_fbx_inner(path, world, registry, texture_base_path, false)
+}
+
+/// Export FBX with optional Unreal Engine collision geometry.
+pub fn export_fbx_unreal(
+    path: &str,
+    world: &OctreeWorld,
+    registry: Option<&TextureRegistry>,
+    texture_base_path: Option<&str>,
+) -> Result<(), String> {
+    export_fbx_inner(path, world, registry, texture_base_path, true)
+}
+
+fn export_fbx_inner(
+    path: &str,
+    world: &OctreeWorld,
+    registry: Option<&TextureRegistry>,
+    texture_base_path: Option<&str>,
+    unreal_collision: bool,
 ) -> Result<(), String> {
     // ── 1. Generate and optimise mesh ────────────────────────────────────
     let (raw_verts, raw_indices) = crate::geometry::build_mesh_with_textures(world, registry);
@@ -668,7 +970,7 @@ pub fn export_fbx(
     for t in 0..tri_count {
         let vi = indices[t * 3] as usize;
         let layer = verts[vi].color[3];
-        let key = if layer < 0.0 { -1 } else { layer.round() as i32 };
+        let key = if layer >= 0.0 { layer.round() as i32 } else { layer.round() as i32 };
 
         let g = group_map.entry(key).or_insert_with(|| {
             let idx = groups.len();
@@ -678,6 +980,44 @@ pub fn export_fbx(
         groups[*g].indices.push(indices[t * 3]);
         groups[*g].indices.push(indices[t * 3 + 1]);
         groups[*g].indices.push(indices[t * 3 + 2]);
+    }
+
+    // ── 2b. Remove sky + separate material volumes ──────────────────────
+    groups.retain(|g| g.slot_key != 0);  // remove sky
+
+    // Separate material volumes — write as separate GLB files, keep only solid geometry
+    let mut solid_groups: Vec<FbxGroup> = Vec::new();
+    let base = std::path::Path::new(path);
+    let stem_fbx = base.file_stem().and_then(|s| s.to_str()).unwrap_or("export");
+    let dir_fbx = base.parent().unwrap_or(std::path::Path::new("."));
+    for g in groups {
+        if g.slot_key <= -2 {
+            let mat_name = match g.slot_key {
+                -2 => "glass", -3 => "water", -4 => "lava", -5 => "clip", _ => "material",
+            };
+            let mat_path = dir_fbx.join(format!("{}_{}.glb", stem_fbx, mat_name));
+            eprintln!("  Material volume: {} → {} ({} tris)",
+                mat_name, mat_path.display(), g.indices.len() / 3);
+            let mat_color: [f32; 4] = match g.slot_key {
+                -2 => [0.6, 0.8, 1.0, 0.5],
+                -3 => [0.2, 0.4, 0.9, 0.5],
+                -4 => [1.0, 0.4, 0.1, 0.8],
+                -5 => [1.0, 0.2, 0.2, 0.3],
+                _  => [0.5, 0.5, 0.5, 0.5],
+            };
+            if let Err(e) = write_material_volume_glb(
+                &mat_path.to_string_lossy(), &verts, &g.indices, mat_color
+            ) {
+                eprintln!("  Warning: failed to write {}: {}", mat_name, e);
+            }
+        } else {
+            solid_groups.push(g);
+        }
+    }
+    let groups = solid_groups;
+
+    if groups.is_empty() {
+        return Err("All geometry is sky or material — nothing to export.".into());
     }
 
     // ── 3. Resolve texture paths per group ───────────────────────────────
@@ -708,7 +1048,27 @@ pub fn export_fbx(
         }
     }
 
-    // ── 4. Write FBX ASCII ───────────────────────────────────────────────
+    // ── 4. Generate collision boxes if Unreal mode ────────────────────────
+    let collision_boxes = if unreal_collision {
+        let boxes = generate_collision_boxes(world);
+        eprintln!("  Unreal collision: {} UBX boxes generated from octree leaves", boxes.len());
+        boxes
+    } else {
+        Vec::new()
+    };
+
+    // Derive mesh name for Unreal naming convention
+    let mesh_stem = Path::new(path)
+        .file_stem()
+        .and_then(|s| s.to_str())
+        .unwrap_or("export");
+    let sm_name = if unreal_collision {
+        format!("SM_{}", mesh_stem)
+    } else {
+        mesh_stem.to_string()
+    };
+
+    // ── 5. Write FBX ASCII ───────────────────────────────────────────────
     let out_path = Path::new(path);
     if let Some(parent) = out_path.parent() {
         if !parent.exists() {
@@ -724,6 +1084,9 @@ pub fn export_fbx(
     // FBX header
     writeln!(w, "; FBX 7.4.0 project file").map_err(io_err)?;
     writeln!(w, "; Exported by BBC Cube2 Editor").map_err(io_err)?;
+    if unreal_collision {
+        writeln!(w, "; Unreal Engine collision mode: {} UBX boxes", collision_boxes.len()).map_err(io_err)?;
+    }
     writeln!(w, "; -------------------------------------------").map_err(io_err)?;
     writeln!(w).map_err(io_err)?;
 
@@ -751,10 +1114,12 @@ pub fn export_fbx(
     writeln!(w).map_err(io_err)?;
 
     // Definitions
-    let model_count = groups.len();
-    let mat_count = groups.len();
+    let collision_count = collision_boxes.len();
+    let model_count = groups.len() + collision_count;  // render groups + collision boxes
+    let geom_count = groups.len() + collision_count;
+    let mat_count = groups.len();  // collision boxes don't need materials
     let tex_count = slot_tex_path.len();
-    let total_obj_count = model_count * 2 + mat_count + tex_count; // Geometry+Model per group, Material per group, Texture per textured group
+    let total_obj_count = geom_count + model_count + mat_count + tex_count;
 
     writeln!(w, "Definitions:  {{").map_err(io_err)?;
     writeln!(w, "\tVersion: 100").map_err(io_err)?;
@@ -763,7 +1128,7 @@ pub fn export_fbx(
     writeln!(w, "\t\tCount: 1").map_err(io_err)?;
     writeln!(w, "\t}}").map_err(io_err)?;
     writeln!(w, "\tObjectType: \"Geometry\" {{").map_err(io_err)?;
-    writeln!(w, "\t\tCount: {}", model_count).map_err(io_err)?;
+    writeln!(w, "\t\tCount: {}", geom_count).map_err(io_err)?;
     writeln!(w, "\t}}").map_err(io_err)?;
     writeln!(w, "\tObjectType: \"Model\" {{").map_err(io_err)?;
     writeln!(w, "\t\tCount: {}", model_count).map_err(io_err)?;
@@ -791,13 +1156,22 @@ pub fn export_fbx(
     // Material: 300_000_000 + gi
     // Texture:  400_000_000 + gi
     // Video:    500_000_000 + gi
+    // Collision Geometry: 600_000_000 + ci
+    // Collision Model:    700_000_000 + ci
 
     for (gi, g) in groups.iter().enumerate() {
         let geom_id  = 100_000_000i64 + gi as i64;
         let model_id = 200_000_000i64 + gi as i64;
         let mat_id   = 300_000_000i64 + gi as i64;
 
-        let name = if g.slot_key < 0 {
+        // In Unreal mode: render meshes get SM_ prefix
+        let name = if unreal_collision {
+            if g.slot_key < 0 {
+                format!("{}_Untextured_{}", sm_name, gi)
+            } else {
+                format!("{}_{}", sm_name, gi)
+            }
+        } else if g.slot_key < 0 {
             format!("Untextured_{}", gi)
         } else {
             format!("Slot_{}", g.slot_key)
@@ -962,6 +1336,65 @@ pub fn export_fbx(
         }
     }
 
+    // ── Collision box geometry (Unreal UBX_ convention) ────────────────
+    if unreal_collision && !collision_boxes.is_empty() {
+        for (ci, cbox) in collision_boxes.iter().enumerate() {
+            let col_geom_id  = 600_000_000i64 + ci as i64;
+            let col_model_id = 700_000_000i64 + ci as i64;
+            let col_name = format!("UBX_{}_{:04}", sm_name, ci);
+
+            // Geometry: 8 vertices, 12 triangles (6 faces × 2 tris)
+            writeln!(w, "\tGeometry: {}, \"Geometry::{}\", \"Mesh\" {{", col_geom_id, col_name).map_err(io_err)?;
+
+            // Vertices (8 corners)
+            write!(w, "\t\tVertices: *24 {{").map_err(io_err)?;
+            write!(w, "\n\t\t\ta: ").map_err(io_err)?;
+            for (i, c) in cbox.corners.iter().enumerate() {
+                if i > 0 { write!(w, ",").map_err(io_err)?; }
+                write!(w, "{},{},{}", c[0], c[1], c[2]).map_err(io_err)?;
+            }
+            writeln!(w, "\n\t\t}}").map_err(io_err)?;
+
+            // PolygonVertexIndex: 12 triangles for a box (6 faces × 2 tris)
+            // Face winding must be consistent. Using right-hand rule.
+            // Corners layout:
+            //   0=(min,min,min) 1=(max,min,min) 2=(min,min,max) 3=(max,min,max)
+            //   4=(min,max,min) 5=(max,max,min) 6=(min,max,max) 7=(max,max,max)
+            let box_tris: [[i32; 3]; 12] = [
+                // -Y face (bottom): 0,1,3,2
+                [0, 1, 3], [0, 3, 2],
+                // +Y face (top): 4,6,7,5
+                [4, 6, 7], [4, 7, 5],
+                // -X face (left): 0,2,6,4
+                [0, 2, 6], [0, 6, 4],
+                // +X face (right): 1,5,7,3
+                [1, 5, 7], [1, 7, 3],
+                // -Z face (front): 0,4,5,1
+                [0, 4, 5], [0, 5, 1],
+                // +Z face (back): 2,3,7,6
+                [2, 3, 7], [2, 7, 6],
+            ];
+
+            write!(w, "\t\tPolygonVertexIndex: *36 {{").map_err(io_err)?;
+            write!(w, "\n\t\t\ta: ").map_err(io_err)?;
+            for (ti, tri) in box_tris.iter().enumerate() {
+                if ti > 0 { write!(w, ",").map_err(io_err)?; }
+                write!(w, "{},{},{}", tri[0], tri[1], -(tri[2] + 1)).map_err(io_err)?;
+            }
+            writeln!(w, "\n\t\t}}").map_err(io_err)?;
+
+            writeln!(w, "\t}}").map_err(io_err)?;  // end Geometry
+
+            // Model
+            writeln!(w, "\tModel: {}, \"Model::{}\", \"Mesh\" {{", col_model_id, col_name).map_err(io_err)?;
+            writeln!(w, "\t\tVersion: 232").map_err(io_err)?;
+            writeln!(w, "\t\tProperties70:  {{").map_err(io_err)?;
+            writeln!(w, "\t\t\tP: \"Lcl Translation\", \"Lcl Translation\", \"\", \"A\",0,0,0").map_err(io_err)?;
+            writeln!(w, "\t\t}}").map_err(io_err)?;
+            writeln!(w, "\t}}").map_err(io_err)?;
+        }
+    }
+
     writeln!(w, "}}").map_err(io_err)?;  // end Objects
     writeln!(w).map_err(io_err)?;
 
@@ -986,6 +1419,19 @@ pub fn export_fbx(
             let video_id = 500_000_000i64 + gi as i64;
             writeln!(w, "\tC: \"OP\",{},{},\"DiffuseColor\"", tex_id, mat_id).map_err(io_err)?;
             writeln!(w, "\tC: \"OO\",{},{}", video_id, tex_id).map_err(io_err)?;
+        }
+    }
+
+    // Collision box connections
+    if unreal_collision {
+        for ci in 0..collision_boxes.len() {
+            let col_geom_id  = 600_000_000i64 + ci as i64;
+            let col_model_id = 700_000_000i64 + ci as i64;
+
+            // Collision Model -> Root (0)
+            writeln!(w, "\tC: \"OO\",{},0", col_model_id).map_err(io_err)?;
+            // Collision Geometry -> Collision Model
+            writeln!(w, "\tC: \"OO\",{},{}", col_geom_id, col_model_id).map_err(io_err)?;
         }
     }
 
@@ -1059,5 +1505,26 @@ mod tests {
         assert_eq!(guess_image_mime("foo/bar.jpg"), "image/jpeg");
         assert_eq!(guess_image_mime("foo/bar.JPEG"), "image/jpeg");
         assert_eq!(guess_image_mime("foo/bar.tga"), "image/png");
+    }
+
+    #[test]
+    fn test_collision_boxes_from_solid_world() {
+        use crate::octree::{Cube, OctreeWorld, EDGES_SOLID, newcubes, F_SOLID, MAT_AIR};
+        // Create a small world with one solid cube
+        let mut root = newcubes(F_SOLID, MAT_AIR);
+        root[0].edges = EDGES_SOLID;
+        let world = OctreeWorld {
+            root,
+            world_scale: 4,  // 16x16x16
+            entities: Vec::new(),
+            ogz_version: 33,
+        };
+        let boxes = generate_collision_boxes(&world);
+        // Should produce at least 1 collision box for the solid leaf
+        assert!(!boxes.is_empty(), "Expected collision boxes from solid geometry, got 0");
+        // Each box should have 8 corners
+        for b in &boxes {
+            assert_eq!(b.corners.len(), 8);
+        }
     }
 }

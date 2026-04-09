@@ -658,6 +658,8 @@ fn build_editor_ui(
                         editor.request_export_fbx = true;
                         ui.close_menu();
                     }
+                    ui.checkbox(&mut editor.export_unreal_collision,
+                        "Unreal Engine collision (UBX)");
                     ui.separator();
                     if ui.add(egui::Button::new("Package Map   Ctrl+P")).clicked() {
                         editor.request_package_map = true;
@@ -987,21 +989,45 @@ fn handle_export_fbx(editor: &editor::EditorState) {
         .and_then(|s| s.to_str())
         .unwrap_or("untitled");
 
+    let title = if editor.export_unreal_collision {
+        "Export FBX (Unreal Engine + Collision)"
+    } else {
+        "Export FBX"
+    };
+
     let dialog = rfd::FileDialog::new()
-        .set_title("Export FBX")
+        .set_title(title)
         .set_file_name(&format!("{}.fbx", default_name))
         .add_filter("Autodesk FBX", &["fbx"]);
 
     if let Some(path) = dialog.save_file() {
         let path_str = path.display().to_string();
         let tex_base = editor.packages_dir.as_deref();
-        match cube_world::export_fbx(
-            &path_str,
-            &editor.edit_world.world,
-            Some(&editor.tex_registry),
-            tex_base,
-        ) {
-            Ok(()) => println!("Exported FBX: {}", path_str),
+
+        let result = if editor.export_unreal_collision {
+            cube_world::export_fbx_unreal(
+                &path_str,
+                &editor.edit_world.world,
+                Some(&editor.tex_registry),
+                tex_base,
+            )
+        } else {
+            cube_world::export_fbx(
+                &path_str,
+                &editor.edit_world.world,
+                Some(&editor.tex_registry),
+                tex_base,
+            )
+        };
+
+        match result {
+            Ok(()) => {
+                if editor.export_unreal_collision {
+                    println!("Exported FBX with Unreal collision: {}", path_str);
+                } else {
+                    println!("Exported FBX: {}", path_str);
+                }
+            }
             Err(e) => eprintln!("FBX export failed: {}", e),
         }
     }
@@ -1219,8 +1245,12 @@ fn load_map_textures(
         let diffuse_path = slot.textures.first().map(|t| t.path.clone()).unwrap_or_default();
 
         if diffuse_path.is_empty() {
-            // No texture path — generate a solid color layer
-            layers.push(generate_fallback_layer(TEX_SIZE, slot_idx));
+            // No texture path — sky slot gets special pattern, others get fallback
+            if slot_idx == 0 {
+                layers.push(generate_sky_layer(TEX_SIZE));
+            } else {
+                layers.push(generate_fallback_layer(TEX_SIZE, slot_idx));
+            }
             continue;
         }
 
@@ -1305,6 +1335,32 @@ fn load_and_resize_image(path: &std::path::Path, tex_size: u32) -> Option<Vec<u8
 }
 
 /// Generate a solid-color fallback texture layer for a missing texture.
+/// Generate a distinctive magenta/black diagonal stripe pattern for sky faces.
+/// These faces will be removed on export — this makes them visually obvious.
+fn generate_sky_layer(tex_size: u32) -> Vec<u8> {
+    let npixels = (tex_size * tex_size) as usize;
+    let mut data = vec![0u8; npixels * 4];
+
+    for y in 0..tex_size {
+        for x in 0..tex_size {
+            // Diagonal stripes with "SKY" feel
+            let stripe = ((x + y) / 16) % 2 == 0;
+            let idx = ((y * tex_size + x) * 4) as usize;
+            if stripe {
+                data[idx]     = 200; // magenta
+                data[idx + 1] = 0;
+                data[idx + 2] = 200;
+            } else {
+                data[idx]     = 30;  // dark
+                data[idx + 1] = 0;
+                data[idx + 2] = 30;
+            }
+            data[idx + 3] = 255;
+        }
+    }
+    data
+}
+
 fn generate_fallback_layer(tex_size: u32, slot_idx: usize) -> Vec<u8> {
     let npixels = (tex_size * tex_size) as usize;
     let mut data = vec![0u8; npixels * 4];

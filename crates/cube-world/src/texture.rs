@@ -600,7 +600,15 @@ pub fn load_texture_config(registry: &mut TextureRegistry, text: &str) {
             "texture" => {
                 if parts.len() >= 3 {
                     let tex_type_str = parts[1].trim_matches('"');
-                    let path = parts[2].trim_matches('"').to_string();
+                    let mut path = parts[2].trim_matches('"').to_string();
+                    // Strip Cube2 <dds> / <premul> / <luma> prefixes
+                    while path.starts_with('<') {
+                        if let Some(end) = path.find('>') {
+                            path = path[end + 1..].to_string();
+                        } else {
+                            break;
+                        }
+                    }
 
                     let tex_type = match tex_type_str {
                         "0" | "c" => TexType::Diffuse,
