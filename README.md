@@ -57,12 +57,18 @@ cargo build --release
 ## Usage
 
 ```bash
-# New empty map
+# Launch with the included Thor2009 map (default)
 cube-bauhaus
 
-# Load a Sauerbraten map
+# Load any Sauerbraten map
 cube-bauhaus path/to/map.ogz
 ```
+
+### Default Map: Thor2009
+
+![Thor2009](docs/thor2009_preview.jpg)
+
+Cube Bauhaus ships with **Thor2009** by cronos (Gregor Koch, 2009) — an industrial underwater environment originally created for Sauerbraten and published on [Quadropolis](https://quadropolis.github.io/). Complete with custom textures, normal maps, specular maps, and architectural model kit.
 
 ## Architecture
 

@@ -36,14 +36,23 @@ fn main() {
         )
         .init();
 
-    let map_path = std::env::args().nth(1);
+    let map_path = std::env::args().nth(1).or_else(|| {
+        // Default map: Thor2009 by cronos (Gregor Koch), 2009
+        let default = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("packages/base/Thor2009.ogz");
+        if default.exists() {
+            Some(default.display().to_string())
+        } else {
+            None
+        }
+    });
 
     // ── Window ────────────────────────────────────────────────────────────────
     let event_loop = EventLoop::new().unwrap();
     event_loop.set_control_flow(ControlFlow::Poll);
 
     let window = WindowBuilder::new()
-        .with_title("BBC — Cube2 Editor")
+        .with_title("Cube Bauhaus")
         .with_inner_size(winit::dpi::LogicalSize::new(1600u32, 900u32))
         .build(&event_loop)
         .unwrap();
@@ -70,7 +79,7 @@ fn main() {
             }
         }
         None => {
-            println!("No map specified — generating test world.  Pass a .ogz path to load one.");
+            println!("No map found — generating test world.  Pass a .ogz path to load one.");
             make_test_world()
         }
     };
