@@ -787,6 +787,51 @@ fn write_material_volume_glb(
     Ok(())
 }
 
+/// Map TexType to a unique channel offset for FBX ID generation.
+/// Each channel gets its own million-range to avoid ID collisions.
+fn textype_channel_offset(tt: TexType) -> i64 {
+    match tt {
+        TexType::Diffuse => 0,
+        TexType::Normal  => 1,
+        TexType::Spec    => 2,
+        TexType::Glow    => 3,
+        TexType::Alpha   => 4,
+        _                => 5,
+    }
+}
+
+/// Map TexType to a human-readable label for FBX object naming.
+fn textype_label(tt: TexType) -> &'static str {
+    match tt {
+        TexType::Diffuse => "Diffuse",
+        TexType::Normal  => "Normal",
+        TexType::Spec    => "Specular",
+        TexType::Glow    => "Emissive",
+        TexType::Alpha   => "Alpha",
+        _                => "Other",
+    }
+}
+
+/// Map TexType to the FBX material property name that Unreal Engine
+/// recognizes for auto-material creation on import.
+///
+/// Key mappings (confirmed from FBX SDK + Unreal source):
+///   Diffuse  → "DiffuseColor"       → UE Base Color (auto-connected)
+///   Normal   → "NormalMap"           → UE Normal (auto-connected)
+///   Spec     → "SpecularFactor"      → UE Specular
+///   Glow     → "EmissiveColor"       → UE Emissive
+///   Alpha    → "TransparencyFactor"  → UE Opacity
+fn textype_to_fbx_property(tt: TexType) -> &'static str {
+    match tt {
+        TexType::Diffuse => "DiffuseColor",
+        TexType::Normal  => "NormalMap",
+        TexType::Spec    => "SpecularFactor",
+        TexType::Glow    => "EmissiveColor",
+        TexType::Alpha   => "TransparencyFactor",
+        _                => "DiffuseColor",
+    }
+}
+
 /// Guess MIME type from a file path extension.
 fn guess_image_mime(path: &str) -> &'static str {
     let lower = path.to_ascii_lowercase();
@@ -1020,32 +1065,75 @@ fn export_fbx_inner(
         return Err("All geometry is sky or material — nothing to export.".into());
     }
 
-    // ── 3. Resolve texture paths per group ───────────────────────────────
-    let mut slot_tex_path: HashMap<i32, String> = HashMap::new();
+    // ── 3. Resolve ALL texture paths per group (diffuse, normal, spec, glow, etc.)
+    //
+    // Maps slot_key → Vec<(TexType, resolved_path)>.
+    // Each entry is one texture channel that exists on disk.
+    let mut slot_textures: HashMap<i32, Vec<(TexType, String)>> = HashMap::new();
     if let (Some(reg), Some(base)) = (registry, texture_base_path) {
         for g in &groups {
             if g.slot_key < 0 { continue; }
-            if slot_tex_path.contains_key(&g.slot_key) { continue; }
+            if slot_textures.contains_key(&g.slot_key) { continue; }
+
+            // Find the Slot whose diffuse layer matches this group key
             for slot in &reg.slots {
-                if let Some(dtex) = slot.textures.iter().find(|t| t.tex_type == TexType::Diffuse) {
-                    if dtex.layer as i32 == g.slot_key && !dtex.path.is_empty() {
-                        let tex_path = Path::new(base).join(&dtex.path);
-                        if tex_path.exists() {
-                            slot_tex_path.insert(g.slot_key, tex_path.display().to_string());
-                        } else {
-                            // Try alternatives
-                            for alt in try_alternative_paths(&tex_path) {
-                                if alt.exists() {
-                                    slot_tex_path.insert(g.slot_key, alt.display().to_string());
-                                    break;
-                                }
+                let diffuse_match = slot.textures.iter()
+                    .find(|t| t.tex_type == TexType::Diffuse && t.layer as i32 == g.slot_key);
+                if diffuse_match.is_none() { continue; }
+
+                let mut resolved: Vec<(TexType, String)> = Vec::new();
+
+                for stex in &slot.textures {
+                    if stex.path.is_empty() { continue; }
+                    // Skip types that have no FBX equivalent
+                    match stex.tex_type {
+                        TexType::Unknown | TexType::Decal | TexType::Depth | TexType::Envmap => continue,
+                        _ => {}
+                    }
+
+                    let tex_path = Path::new(base).join(&stex.path);
+                    if tex_path.exists() {
+                        resolved.push((stex.tex_type, tex_path.display().to_string()));
+                    } else {
+                        // Try alternative extensions
+                        let mut found = false;
+                        for alt in try_alternative_paths(&tex_path) {
+                            if alt.exists() {
+                                resolved.push((stex.tex_type, alt.display().to_string()));
+                                found = true;
+                                break;
                             }
                         }
-                        break;
+                        if !found {
+                            // Still record the path even if not found — Unreal can locate it
+                            // if the textures are copied alongside the FBX
+                            if stex.tex_type == TexType::Diffuse {
+                                // Only insist on diffuse existing
+                            } else {
+                                // For secondary channels, include path even if missing
+                                resolved.push((stex.tex_type, tex_path.display().to_string()));
+                            }
+                        }
                     }
                 }
+
+                if !resolved.is_empty() {
+                    slot_textures.insert(g.slot_key, resolved);
+                }
+                break;
             }
         }
+    }
+
+    // Log texture channel stats
+    {
+        let total_channels: usize = slot_textures.values().map(|v| v.len()).sum();
+        let slots_with_normal = slot_textures.values()
+            .filter(|v| v.iter().any(|(t, _)| *t == TexType::Normal)).count();
+        let slots_with_spec = slot_textures.values()
+            .filter(|v| v.iter().any(|(t, _)| *t == TexType::Spec)).count();
+        eprintln!("  FBX textures: {} channels across {} slots ({} with normals, {} with spec)",
+            total_channels, slot_textures.len(), slots_with_normal, slots_with_spec);
     }
 
     // ── 4. Generate collision boxes if Unreal mode ────────────────────────
@@ -1118,8 +1206,9 @@ fn export_fbx_inner(
     let model_count = groups.len() + collision_count;  // render groups + collision boxes
     let geom_count = groups.len() + collision_count;
     let mat_count = groups.len();  // collision boxes don't need materials
-    let tex_count = slot_tex_path.len();
-    let total_obj_count = geom_count + model_count + mat_count + tex_count;
+    // Count total texture objects (each channel = 1 Texture + 1 Video)
+    let tex_obj_count: usize = slot_textures.values().map(|v| v.len()).sum();
+    let total_obj_count = geom_count + model_count + mat_count + tex_obj_count * 2;
 
     writeln!(w, "Definitions:  {{").map_err(io_err)?;
     writeln!(w, "\tVersion: 100").map_err(io_err)?;
@@ -1136,12 +1225,12 @@ fn export_fbx_inner(
     writeln!(w, "\tObjectType: \"Material\" {{").map_err(io_err)?;
     writeln!(w, "\t\tCount: {}", mat_count).map_err(io_err)?;
     writeln!(w, "\t}}").map_err(io_err)?;
-    if tex_count > 0 {
+    if tex_obj_count > 0 {
         writeln!(w, "\tObjectType: \"Texture\" {{").map_err(io_err)?;
-        writeln!(w, "\t\tCount: {}", tex_count).map_err(io_err)?;
+        writeln!(w, "\t\tCount: {}", tex_obj_count).map_err(io_err)?;
         writeln!(w, "\t}}").map_err(io_err)?;
         writeln!(w, "\tObjectType: \"Video\" {{").map_err(io_err)?;
-        writeln!(w, "\t\tCount: {}", tex_count).map_err(io_err)?;
+        writeln!(w, "\t\tCount: {}", tex_obj_count).map_err(io_err)?;
         writeln!(w, "\t}}").map_err(io_err)?;
     }
     writeln!(w, "}}").map_err(io_err)?;
@@ -1304,35 +1393,46 @@ fn export_fbx_inner(
         writeln!(w, "\t}}").map_err(io_err)?;
     }
 
-    // ── Texture & Video objects for textured slots ────────────────────────
+    // ── Texture & Video objects for ALL texture channels ────────────────
+    // ID scheme per channel: base + channel_offset * 1_000_000 + group_index
+    //   Diffuse: 400_000_000, Normal: 401_000_000, Spec: 402_000_000,
+    //   Glow: 403_000_000, Alpha: 404_000_000
+    //   Video IDs mirror at 500_xxx_xxx
     for (gi, g) in groups.iter().enumerate() {
-        if let Some(tex_path) = slot_tex_path.get(&g.slot_key) {
-            let tex_id   = 400_000_000i64 + gi as i64;
-            let video_id = 500_000_000i64 + gi as i64;
+        if let Some(textures) = slot_textures.get(&g.slot_key) {
+            for (tex_type, tex_path) in textures {
+                let channel_offset = textype_channel_offset(*tex_type);
+                let tex_id   = 400_000_000i64 + channel_offset * 1_000_000 + gi as i64;
+                let video_id = 500_000_000i64 + channel_offset * 1_000_000 + gi as i64;
 
-            let filename = Path::new(tex_path)
-                .file_name()
-                .and_then(|s| s.to_str())
-                .unwrap_or("texture.jpg");
+                let filename = Path::new(tex_path)
+                    .file_name()
+                    .and_then(|s| s.to_str())
+                    .unwrap_or("texture.jpg");
 
-            // Texture
-            writeln!(w, "\tTexture: {}, \"Texture::{}\", \"\" {{", tex_id, filename).map_err(io_err)?;
-            writeln!(w, "\t\tType: \"TextureVideoClip\"").map_err(io_err)?;
-            writeln!(w, "\t\tVersion: 202").map_err(io_err)?;
-            writeln!(w, "\t\tTextureName: \"Texture::{}\"", filename).map_err(io_err)?;
-            writeln!(w, "\t\tFileName: \"{}\"", tex_path.replace('\\', "/")).map_err(io_err)?;
-            writeln!(w, "\t\tRelativeFilename: \"{}\"", filename).map_err(io_err)?;
-            writeln!(w, "\t\tProperties70:  {{").map_err(io_err)?;
-            writeln!(w, "\t\t\tP: \"UVSet\", \"KString\", \"\", \"\", \"UVChannel_1\"").map_err(io_err)?;
-            writeln!(w, "\t\t}}").map_err(io_err)?;
-            writeln!(w, "\t}}").map_err(io_err)?;
+                let channel_label = textype_label(*tex_type);
 
-            // Video (media clip)
-            writeln!(w, "\tVideo: {}, \"Video::{}\", \"Clip\" {{", video_id, filename).map_err(io_err)?;
-            writeln!(w, "\t\tType: \"Clip\"").map_err(io_err)?;
-            writeln!(w, "\t\tFileName: \"{}\"", tex_path.replace('\\', "/")).map_err(io_err)?;
-            writeln!(w, "\t\tRelativeFilename: \"{}\"", filename).map_err(io_err)?;
-            writeln!(w, "\t}}").map_err(io_err)?;
+                // Texture
+                writeln!(w, "\tTexture: {}, \"Texture::{}_{}\", \"\" {{",
+                    tex_id, channel_label, filename).map_err(io_err)?;
+                writeln!(w, "\t\tType: \"TextureVideoClip\"").map_err(io_err)?;
+                writeln!(w, "\t\tVersion: 202").map_err(io_err)?;
+                writeln!(w, "\t\tTextureName: \"Texture::{}\"", filename).map_err(io_err)?;
+                writeln!(w, "\t\tFileName: \"{}\"", tex_path.replace('\\', "/")).map_err(io_err)?;
+                writeln!(w, "\t\tRelativeFilename: \"{}\"", filename).map_err(io_err)?;
+                writeln!(w, "\t\tProperties70:  {{").map_err(io_err)?;
+                writeln!(w, "\t\t\tP: \"UVSet\", \"KString\", \"\", \"\", \"UVChannel_1\"").map_err(io_err)?;
+                writeln!(w, "\t\t}}").map_err(io_err)?;
+                writeln!(w, "\t}}").map_err(io_err)?;
+
+                // Video (media clip)
+                writeln!(w, "\tVideo: {}, \"Video::{}_{}\", \"Clip\" {{",
+                    video_id, channel_label, filename).map_err(io_err)?;
+                writeln!(w, "\t\tType: \"Clip\"").map_err(io_err)?;
+                writeln!(w, "\t\tFileName: \"{}\"", tex_path.replace('\\', "/")).map_err(io_err)?;
+                writeln!(w, "\t\tRelativeFilename: \"{}\"", filename).map_err(io_err)?;
+                writeln!(w, "\t}}").map_err(io_err)?;
+            }
         }
     }
 
@@ -1413,12 +1513,19 @@ fn export_fbx_inner(
         // Material -> Model
         writeln!(w, "\tC: \"OO\",{},{}", mat_id, model_id).map_err(io_err)?;
 
-        // Texture -> Material (DiffuseColor property)
-        if slot_tex_path.contains_key(&g.slot_key) {
-            let tex_id   = 400_000_000i64 + gi as i64;
-            let video_id = 500_000_000i64 + gi as i64;
-            writeln!(w, "\tC: \"OP\",{},{},\"DiffuseColor\"", tex_id, mat_id).map_err(io_err)?;
-            writeln!(w, "\tC: \"OO\",{},{}", video_id, tex_id).map_err(io_err)?;
+        // Texture channels -> Material properties
+        if let Some(textures) = slot_textures.get(&g.slot_key) {
+            for (tex_type, _) in textures {
+                let channel_offset = textype_channel_offset(*tex_type);
+                let tex_id   = 400_000_000i64 + channel_offset * 1_000_000 + gi as i64;
+                let video_id = 500_000_000i64 + channel_offset * 1_000_000 + gi as i64;
+                let fbx_prop = textype_to_fbx_property(*tex_type);
+
+                // Texture -> Material (specific property)
+                writeln!(w, "\tC: \"OP\",{},{},\"{}\"", tex_id, mat_id, fbx_prop).map_err(io_err)?;
+                // Video -> Texture
+                writeln!(w, "\tC: \"OO\",{},{}", video_id, tex_id).map_err(io_err)?;
+            }
         }
     }
 
