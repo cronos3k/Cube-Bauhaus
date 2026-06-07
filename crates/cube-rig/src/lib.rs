@@ -21,6 +21,7 @@
 //! egui tool palette.
 
 pub mod anim;
+pub mod controller;
 pub mod export;
 pub mod ik;
 pub mod import;
@@ -32,6 +33,7 @@ pub mod state;
 pub mod viz;
 pub mod weights;
 
+pub use controller::{RenderVertex, RigController};
 pub use mesh::{Influence, RigVertex, SkinnedMesh, MAX_INFLUENCES};
 pub use select::{SelectMode, VertexSelection};
 pub use skeleton::{Bone, Skeleton};

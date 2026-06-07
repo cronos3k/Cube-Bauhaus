@@ -795,6 +795,7 @@ dependencies = [
  "bbc-renderer",
  "bytemuck",
  "clap",
+ "cube-rig",
  "cube-world",
  "egui",
  "egui-winit",
