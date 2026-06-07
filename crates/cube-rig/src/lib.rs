@@ -20,6 +20,7 @@
 //! fully unit-testable headless; the editor layer drives it with a camera and an
 //! egui tool palette.
 
+pub mod anim;
 pub mod export;
 pub mod ik;
 pub mod import;

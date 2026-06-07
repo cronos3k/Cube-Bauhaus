@@ -66,6 +66,45 @@ fn glb_export_reimports_with_skeleton_and_weights() {
 }
 
 #[test]
+fn glb_animation_exports_channels_readable_by_gltf() {
+    use cube_rig::anim::{AnimationClip, BoneTrack};
+    use cube_rig::export::glb::export_glb_animated;
+    use glam::Quat;
+
+    let (mesh, sk) = sample_rig();
+
+    // a clip that translates the root and rotates the tip
+    let mut clip = AnimationClip::new("wiggle");
+    let mut root_tr = BoneTrack::new(0);
+    root_tr.translation = vec![(0.0, Vec3::ZERO), (1.0, Vec3::new(0.0, 0.5, 0.0))];
+    let mut tip_tr = BoneTrack::new(1);
+    tip_tr.rotation = vec![
+        (0.0, Quat::IDENTITY),
+        (1.0, Quat::from_rotation_z(std::f32::consts::FRAC_PI_2)),
+    ];
+    clip.tracks.push(root_tr);
+    clip.tracks.push(tip_tr);
+
+    let path = std::env::temp_dir().join("cube_rig_anim.glb");
+    export_glb_animated(&path, &mesh, &sk, std::slice::from_ref(&clip)).expect("export");
+
+    // re-read with the gltf crate as an independent validator
+    let (doc, _b, _i) = gltf::import(&path).expect("reimport");
+    let anims: Vec<_> = doc.animations().collect();
+    assert_eq!(anims.len(), 1);
+    assert_eq!(anims[0].name(), Some("wiggle"));
+    let channels: Vec<_> = anims[0].channels().collect();
+    assert_eq!(channels.len(), 2);
+    // one translation channel, one rotation channel
+    use gltf::animation::Property;
+    let props: Vec<_> = channels.iter().map(|c| c.target().property()).collect();
+    assert!(props.iter().any(|p| matches!(p, Property::Translation)));
+    assert!(props.iter().any(|p| matches!(p, Property::Rotation)));
+
+    let _ = std::fs::remove_file(&path);
+}
+
+#[test]
 fn obj_export_reimports_geometry() {
     let (mesh, _sk) = sample_rig();
     let path = std::env::temp_dir().join("cube_rig_roundtrip.obj");

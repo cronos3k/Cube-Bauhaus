@@ -11,6 +11,7 @@ use std::path::Path;
 
 use glam::Mat4;
 
+use crate::anim::AnimationClip;
 use crate::mesh::SkinnedMesh;
 use crate::skeleton::Skeleton;
 
@@ -25,8 +26,28 @@ pub fn export_glb(path: &Path, mesh: &SkinnedMesh, skeleton: &Skeleton) -> Resul
     std::fs::write(path, bytes).map_err(|e| ExportError::Io(e.to_string()))
 }
 
-/// Build the in-memory `.glb` byte stream.
+/// Build the in-memory `.glb` byte stream (no animations).
 pub fn build_glb(mesh: &SkinnedMesh, skeleton: &Skeleton) -> Result<Vec<u8>, ExportError> {
+    build_glb_animated(mesh, skeleton, &[])
+}
+
+/// Export a skinned, animated `.glb` file.
+pub fn export_glb_animated(
+    path: &Path,
+    mesh: &SkinnedMesh,
+    skeleton: &Skeleton,
+    animations: &[AnimationClip],
+) -> Result<(), ExportError> {
+    let bytes = build_glb_animated(mesh, skeleton, animations)?;
+    std::fs::write(path, bytes).map_err(|e| ExportError::Io(e.to_string()))
+}
+
+/// Build the in-memory `.glb` byte stream with optional skeletal animations.
+pub fn build_glb_animated(
+    mesh: &SkinnedMesh,
+    skeleton: &Skeleton,
+    animations: &[AnimationClip],
+) -> Result<Vec<u8>, ExportError> {
     if mesh.vertices.is_empty() {
         return Err(ExportError::Empty);
     }
@@ -164,6 +185,56 @@ pub fn build_glb(mesh: &SkinnedMesh, skeleton: &Skeleton) -> Result<Vec<u8>, Exp
         scene_nodes.push(joint_node(r).to_string());
     }
 
+    // ── Animations ─────────────────────────────────────────────────────────
+    // Each track channel becomes a sampler (time accessor → value accessor) and
+    // a channel targeting the joint node's translation/rotation/scale path.
+    let mut animations_json: Vec<String> = Vec::new();
+    for clip in animations {
+        let mut samplers: Vec<String> = Vec::new();
+        let mut channels: Vec<String> = Vec::new();
+
+        for track in &clip.tracks {
+            let node = joint_node(track.bone as usize);
+
+            // translation (VEC3)
+            if !track.translation.is_empty() {
+                let times: Vec<f32> = track.translation.iter().map(|k| k.0).collect();
+                let vals: Vec<[f32; 3]> = track.translation.iter().map(|k| k.1.to_array()).collect();
+                add_vec3_channel(
+                    &mut bin, &mut views, &mut accessors, &mut samplers, &mut channels,
+                    &times, &vals, node, "translation",
+                );
+            }
+            // scale (VEC3)
+            if !track.scale.is_empty() {
+                let times: Vec<f32> = track.scale.iter().map(|k| k.0).collect();
+                let vals: Vec<[f32; 3]> = track.scale.iter().map(|k| k.1.to_array()).collect();
+                add_vec3_channel(
+                    &mut bin, &mut views, &mut accessors, &mut samplers, &mut channels,
+                    &times, &vals, node, "scale",
+                );
+            }
+            // rotation (VEC4 quat, xyzw)
+            if !track.rotation.is_empty() {
+                let times: Vec<f32> = track.rotation.iter().map(|k| k.0).collect();
+                let vals: Vec<[f32; 4]> = track.rotation.iter().map(|k| k.1.to_array()).collect();
+                add_vec4_channel(
+                    &mut bin, &mut views, &mut accessors, &mut samplers, &mut channels,
+                    &times, &vals, node, "rotation",
+                );
+            }
+        }
+
+        if !samplers.is_empty() {
+            animations_json.push(format!(
+                r#"{{"name":{},"samplers":[{}],"channels":[{}]}}"#,
+                json_string(&clip.name),
+                samplers.join(","),
+                channels.join(",")
+            ));
+        }
+    }
+
     // ── Buffer views JSON ─────────────────────────────────────────────────────
     let views_json: Vec<String> = views
         .iter()
@@ -179,15 +250,22 @@ pub fn build_glb(mesh: &SkinnedMesh, skeleton: &Skeleton) -> Result<Vec<u8>, Exp
         r#"{{"attributes":{{"POSITION":{pos_acc},"NORMAL":{nrm_acc},"TEXCOORD_0":{uv_acc},"JOINTS_0":{joint_acc},"WEIGHTS_0":{weight_acc}}},"indices":{idx_acc}}}"#
     );
 
+    let animations_field = if animations_json.is_empty() {
+        String::new()
+    } else {
+        format!(r#","animations":[{}]"#, animations_json.join(","))
+    };
+
     let json = format!(
-        r#"{{"asset":{{"version":"2.0","generator":"Cube Bauhaus rig bay"}},"scene":0,"scenes":[{{"nodes":[{}]}}],"nodes":[{}],"meshes":[{{"primitives":[{}]}}],"skins":[{}],"accessors":[{}],"bufferViews":[{}],"buffers":[{{"byteLength":{}}}]}}"#,
+        r#"{{"asset":{{"version":"2.0","generator":"Cube Bauhaus rig bay"}},"scene":0,"scenes":[{{"nodes":[{}]}}],"nodes":[{}],"meshes":[{{"primitives":[{}]}}],"skins":[{}],"accessors":[{}],"bufferViews":[{}],"buffers":[{{"byteLength":{}}}]{}}}"#,
         scene_nodes.join(","),
         nodes.join(","),
         primitive,
         skin,
         accessors.join(","),
         views_json.join(","),
-        bin.len()
+        bin.len(),
+        animations_field
     );
 
     Ok(assemble_glb(json.into_bytes(), bin))
@@ -216,6 +294,102 @@ fn packed_influences(inf: &crate::mesh::VertexInfluences) -> ([u16; 4], [f32; 4]
         }
     }
     (joints, weights)
+}
+
+/// Append a `(time → vec3)` animation sampler+channel, creating the input/output
+/// accessors and recording sampler/channel JSON.
+#[allow(clippy::too_many_arguments)]
+fn add_vec3_channel(
+    bin: &mut Vec<u8>,
+    views: &mut Vec<(usize, usize, Option<u32>)>,
+    accessors: &mut Vec<String>,
+    samplers: &mut Vec<String>,
+    channels: &mut Vec<String>,
+    times: &[f32],
+    vals: &[[f32; 3]],
+    node: usize,
+    path: &str,
+) {
+    let in_acc = push_time_accessor(bin, views, accessors, times);
+    let view = push_view(bin, views, None, |b| {
+        for v in vals {
+            push_vec3(b, *v);
+        }
+    });
+    let out_acc = accessors.len();
+    accessors.push(format!(
+        r#"{{"bufferView":{view},"componentType":5126,"count":{},"type":"VEC3"}}"#,
+        vals.len()
+    ));
+    push_sampler_channel(samplers, channels, in_acc, out_acc, node, path);
+}
+
+/// As [`add_vec3_channel`] but for VEC4 outputs (rotation quaternions).
+#[allow(clippy::too_many_arguments)]
+fn add_vec4_channel(
+    bin: &mut Vec<u8>,
+    views: &mut Vec<(usize, usize, Option<u32>)>,
+    accessors: &mut Vec<String>,
+    samplers: &mut Vec<String>,
+    channels: &mut Vec<String>,
+    times: &[f32],
+    vals: &[[f32; 4]],
+    node: usize,
+    path: &str,
+) {
+    let in_acc = push_time_accessor(bin, views, accessors, times);
+    let view = push_view(bin, views, None, |b| {
+        for v in vals {
+            for c in v {
+                push_f32(b, *c);
+            }
+        }
+    });
+    let out_acc = accessors.len();
+    accessors.push(format!(
+        r#"{{"bufferView":{view},"componentType":5126,"count":{},"type":"VEC4"}}"#,
+        vals.len()
+    ));
+    push_sampler_channel(samplers, channels, in_acc, out_acc, node, path);
+}
+
+/// Append a SCALAR time accessor (glTF requires min/max on animation inputs).
+fn push_time_accessor(
+    bin: &mut Vec<u8>,
+    views: &mut Vec<(usize, usize, Option<u32>)>,
+    accessors: &mut Vec<String>,
+    times: &[f32],
+) -> usize {
+    let view = push_view(bin, views, None, |b| {
+        for t in times {
+            push_f32(b, *t);
+        }
+    });
+    let min = times.first().copied().unwrap_or(0.0);
+    let max = times.last().copied().unwrap_or(0.0);
+    let acc = accessors.len();
+    accessors.push(format!(
+        r#"{{"bufferView":{view},"componentType":5126,"count":{},"type":"SCALAR","min":[{min}],"max":[{max}]}}"#,
+        times.len()
+    ));
+    acc
+}
+
+fn push_sampler_channel(
+    samplers: &mut Vec<String>,
+    channels: &mut Vec<String>,
+    in_acc: usize,
+    out_acc: usize,
+    node: usize,
+    path: &str,
+) {
+    let si = samplers.len();
+    samplers.push(format!(
+        r#"{{"input":{in_acc},"output":{out_acc},"interpolation":"LINEAR"}}"#
+    ));
+    channels.push(format!(
+        r#"{{"sampler":{si},"target":{{"node":{node},"path":"{path}"}}}}"#
+    ));
 }
 
 // ── binary helpers ───────────────────────────────────────────────────────────
