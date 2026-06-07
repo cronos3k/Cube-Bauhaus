@@ -27,9 +27,11 @@ pub mod select;
 pub mod skeleton;
 pub mod skeleton_io;
 pub mod state;
+pub mod viz;
 pub mod weights;
 
 pub use mesh::{Influence, RigVertex, SkinnedMesh, MAX_INFLUENCES};
 pub use select::{SelectMode, VertexSelection};
 pub use skeleton::{Bone, Skeleton};
 pub use state::{RigState, Tool};
+pub use viz::{weight_colors, WeightView};
