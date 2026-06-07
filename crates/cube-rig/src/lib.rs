@@ -21,6 +21,7 @@
 //! egui tool palette.
 
 pub mod export;
+pub mod ik;
 pub mod import;
 pub mod mesh;
 pub mod select;
