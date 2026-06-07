@@ -1,5 +1,5 @@
 [workspace]
-members = [".", "crates/cube-world", "crates/bbc-renderer"]
+members = [".", "crates/cube-world", "crates/bbc-renderer", "crates/cube-rig"]
 resolver = "2"
 
 [package]
