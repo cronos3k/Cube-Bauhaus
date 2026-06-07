@@ -427,13 +427,16 @@ fn main() {
                     rig.enabled = !rig.enabled;
                     rig.ctrl.render_dirty = true; // force mesh rebuild/teardown
                 }
-                if rig.enabled && !ui_mode && inp.lmb_just_pressed {
+                if rig.enabled && !ui_mode {
                     let sz = window.inner_size();
-                    rig.on_click(
+                    rig.handle_pointer(
                         &camera,
                         glam::Vec2::new(inp.cursor_x, inp.cursor_y),
                         sz.width,
                         sz.height,
+                        inp.lmb,
+                        inp.lmb_just_pressed,
+                        inp.lmb_just_released,
                     );
                 }
 

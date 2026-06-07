@@ -134,7 +134,10 @@ impl RigController {
                 self.render_dirty = true;
                 !hits.is_empty()
             }
-            Tool::WeightPaint => self.paint(view_proj, viewport, screen, camera_pos),
+            Tool::WeightPaint => {
+                self.begin_stroke("paint");
+                self.paint(view_proj, viewport, screen, camera_pos)
+            }
             // Marquee/Lasso are driven by drag rectangles/polygons via the
             // dedicated methods below; a bare click does nothing for them.
             Tool::Marquee | Tool::Lasso => false,
@@ -160,6 +163,9 @@ impl RigController {
     }
 
     /// Paint the active bone's weight under the brush, with radial falloff.
+    ///
+    /// Does **not** push an undo step — for continuous painting the caller pushes
+    /// one undo snapshot at the start of a stroke (see [`RigController::begin_stroke`]).
     pub fn paint(&mut self, view_proj: &Mat4, viewport: Vec2, screen: Vec2, camera_pos: Vec3) -> bool {
         let Some(bone) = self.state.active_bone else { return false };
         let radius = self.state.brush_radius;
@@ -184,10 +190,14 @@ impl RigController {
         if sel.count() == 0 {
             return false;
         }
-        self.state.push_undo("paint");
         weights::paint(&mut self.state.mesh, &sel, bone, self.state.paint_strength, Some(&falloff));
         self.render_dirty = true;
         true
+    }
+
+    /// Snapshot influences for undo at the start of a paint stroke.
+    pub fn begin_stroke(&mut self, label: &'static str) {
+        self.state.push_undo(label);
     }
 
     // ── selection ops ─────────────────────────────────────────────────────────

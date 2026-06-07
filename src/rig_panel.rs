@@ -27,6 +27,11 @@ pub struct RigBay {
     req_export_glb: bool,
     req_export_fbx: bool,
     req_export_obj: bool,
+
+    // Drag state for marquee / lasso / continuous paint.
+    drag_start: Option<Vec2>,
+    lasso_points: Vec<Vec2>,
+    stroking: bool,
 }
 
 impl Default for RigBay {
@@ -46,6 +51,9 @@ impl RigBay {
             req_export_glb: false,
             req_export_fbx: false,
             req_export_obj: false,
+            drag_start: None,
+            lasso_points: Vec::new(),
+            stroking: false,
         }
     }
 
@@ -240,14 +248,81 @@ impl RigBay {
         }
     }
 
-    /// Map a viewport left-click to the active tool's action. Call when the
-    /// click is not consumed by egui and the camera isn't in mouse-look.
-    pub fn on_click(&mut self, camera: &FlyCamera, cursor: Vec2, width: u32, height: u32) {
+    /// Drive the active tool from pointer state each frame. Handles instantaneous
+    /// actions (bone pick), drag selections (marquee/lasso) and continuous strokes
+    /// (brush-select, weight-paint). Call when the pointer isn't over egui and the
+    /// camera isn't in mouse-look.
+    pub fn handle_pointer(
+        &mut self,
+        camera: &FlyCamera,
+        cursor: Vec2,
+        width: u32,
+        height: u32,
+        down: bool,
+        just_pressed: bool,
+        just_released: bool,
+    ) {
         if !self.enabled || !self.ctrl.has_mesh() {
             return;
         }
         let vp = Self::pick_view_proj(camera, width, height);
-        self.ctrl.click(&vp, Vec2::new(width as f32, height as f32), cursor, camera.pos);
+        let viewport = Vec2::new(width as f32, height as f32);
+        let cam_pos = camera.pos;
+
+        match self.ctrl.state.tool {
+            Tool::BoneSelect => {
+                if just_pressed {
+                    self.ctrl.click(&vp, viewport, cursor, cam_pos);
+                }
+            }
+            Tool::BrushSelect => {
+                // Continuous: select under the brush while dragging.
+                if down {
+                    self.ctrl.click(&vp, viewport, cursor, cam_pos);
+                }
+            }
+            Tool::WeightPaint => {
+                if just_pressed {
+                    self.ctrl.begin_stroke("paint stroke");
+                    self.stroking = true;
+                }
+                if down && self.stroking {
+                    self.ctrl.paint(&vp, viewport, cursor, cam_pos);
+                }
+                if just_released {
+                    self.stroking = false;
+                }
+            }
+            Tool::Marquee => {
+                if just_pressed {
+                    self.drag_start = Some(cursor);
+                }
+                if just_released {
+                    if let Some(start) = self.drag_start.take() {
+                        self.ctrl.marquee(&vp, viewport, start, cursor, cam_pos);
+                    }
+                }
+            }
+            Tool::Lasso => {
+                if just_pressed {
+                    self.lasso_points.clear();
+                    self.lasso_points.push(cursor);
+                }
+                if down {
+                    // Throttle points so the polygon stays light.
+                    if self.lasso_points.last().map_or(true, |p| (*p - cursor).length() > 4.0) {
+                        self.lasso_points.push(cursor);
+                    }
+                }
+                if just_released {
+                    if self.lasso_points.len() >= 3 {
+                        let poly = std::mem::take(&mut self.lasso_points);
+                        self.ctrl.lasso(&vp, viewport, &poly, cam_pos);
+                    }
+                    self.lasso_points.clear();
+                }
+            }
+        }
     }
 
     /// True if the controller's render data changed and the GPU meshes should be
