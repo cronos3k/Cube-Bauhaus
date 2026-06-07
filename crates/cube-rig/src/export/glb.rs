@@ -131,7 +131,7 @@ pub fn build_glb(mesh: &SkinnedMesh, skeleton: &Skeleton) -> Result<Vec<u8>, Exp
     // node 0 = mesh node; nodes 1..=N = joints (bone i → node i+1).
     let joint_node = |bone: usize| bone + 1;
     let mut nodes = Vec::new();
-    nodes.push(format!(r#"{{"name":"rigged_mesh","mesh":0,"skin":0}}"#));
+    nodes.push(r#"{"name":"rigged_mesh","mesh":0,"skin":0}"#.to_string());
     for (i, b) in skeleton.bones.iter().enumerate() {
         let children: Vec<String> = skeleton
             .children(i)
@@ -247,7 +247,7 @@ fn push_view(
     target: Option<u32>,
     fill: impl FnOnce(&mut Vec<u8>),
 ) -> usize {
-    while bin.len() % 4 != 0 {
+    while !bin.len().is_multiple_of(4) {
         bin.push(0);
     }
     let off = bin.len();
@@ -279,10 +279,10 @@ fn json_string(s: &str) -> String {
 
 /// Wrap JSON + BIN chunks into the GLB container.
 fn assemble_glb(mut json: Vec<u8>, mut bin: Vec<u8>) -> Vec<u8> {
-    while json.len() % 4 != 0 {
+    while !json.len().is_multiple_of(4) {
         json.push(b' ');
     }
-    while bin.len() % 4 != 0 {
+    while !bin.len().is_multiple_of(4) {
         bin.push(0);
     }
     let total = 12 + 8 + json.len() + 8 + bin.len();

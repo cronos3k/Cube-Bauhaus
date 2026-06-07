@@ -340,7 +340,7 @@ fn write_connections(
 
     // bone hierarchy: each limb → its parent limb (or scene root)
     for i in 0..skeleton.len() {
-        let parent = skeleton.bones[i].parent.map(|p| limb_id(p)).unwrap_or(0);
+        let parent = skeleton.bones[i].parent.map(limb_id).unwrap_or(0);
         let _ = writeln!(s, "\t;Model::{} -> parent", skeleton.bones[i].name);
         let _ = writeln!(s, "\tC: \"OO\",{},{}", limb_id(i), parent);
     }

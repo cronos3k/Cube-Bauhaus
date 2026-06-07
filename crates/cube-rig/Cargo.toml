@@ -20,9 +20,9 @@ tobj = "4.0"
 fbxcel-dom = { version = "0.0.9", optional = true }
 
 [features]
-# FBX import is opt-in: its dependency tree is heavy and skeletal extraction is
-# best-effort. Enable with `--features fbx-import`.
-default = []
+# FBX import is on by default. Its dependency tree is heavier and skeletal
+# extraction is best-effort; disable with `--no-default-features` if not needed.
+default = ["fbx-import"]
 fbx-import = ["dep:fbxcel-dom"]
 
 [dev-dependencies]

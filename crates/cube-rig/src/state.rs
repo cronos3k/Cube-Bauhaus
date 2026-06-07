@@ -13,8 +13,10 @@ use crate::skeleton::Skeleton;
 
 /// Which interaction tool is active in the rig bay.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Default)]
 pub enum Tool {
     /// Pick / parent bones in the viewport.
+    #[default]
     BoneSelect,
     /// Rectangle vertex selection.
     Marquee,
@@ -26,11 +28,6 @@ pub enum Tool {
     WeightPaint,
 }
 
-impl Default for Tool {
-    fn default() -> Self {
-        Tool::BoneSelect
-    }
-}
 
 /// A reversible edit to per-vertex influences (the only thing weight/selection
 /// ops mutate that's worth undoing). Selection changes are cheap and not
@@ -127,7 +124,7 @@ impl RigState {
             let head = self.skeleton.head_position(i);
             if let Some(p) = crate::select::project(view_proj, head, viewport) {
                 let d = (p - screen).length();
-                if d <= max_pixels && best.map_or(true, |(_, bd)| d < bd) {
+                if d <= max_pixels && best.is_none_or(|(_, bd)| d < bd) {
                     best = Some((i as u16, d));
                 }
             }

@@ -7,7 +7,7 @@
 //! ancestor joint. This stays correct even when non-joint nodes sit between
 //! joints, and we topologically sort so parents always precede children.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::path::Path;
 
 use glam::Mat4;
@@ -155,31 +155,30 @@ fn build_skeleton(
 
 /// Order nodes so each parent precedes its children (Kahn-style, stable).
 fn topo_order(nodes: &[usize], parent_joint: &impl Fn(usize) -> Option<usize>) -> Vec<usize> {
-    let in_set: HashMap<usize, ()> = nodes.iter().map(|&n| (n, ())).collect();
-    let mut placed: HashMap<usize, ()> = HashMap::new();
+    let in_set: HashSet<usize> = nodes.iter().copied().collect();
+    let mut placed: HashSet<usize> = HashSet::new();
     let mut order = Vec::with_capacity(nodes.len());
     // Repeatedly place any node whose parent joint is absent or already placed.
     while order.len() < nodes.len() {
         let before = order.len();
         for &n in nodes {
-            if placed.contains_key(&n) {
+            if placed.contains(&n) {
                 continue;
             }
             let ready = match parent_joint(n) {
-                Some(p) => !in_set.contains_key(&p) || placed.contains_key(&p),
+                Some(p) => !in_set.contains(&p) || placed.contains(&p),
                 None => true,
             };
             if ready {
                 order.push(n);
-                placed.insert(n, ());
+                placed.insert(n);
             }
         }
         if order.len() == before {
             // Cycle (shouldn't happen in valid glTF) — append the rest as-is.
             for &n in nodes {
-                if !placed.contains_key(&n) {
+                if placed.insert(n) {
                     order.push(n);
-                    placed.insert(n, ());
                 }
             }
         }
@@ -211,9 +210,9 @@ fn read_primitive(
         .unwrap_or_else(|| vec![[0.0, 0.0]; vcount]);
 
     let mut verts = Vec::with_capacity(vcount);
-    for i in 0..vcount {
+    for (i, &position) in positions.iter().enumerate() {
         verts.push(RigVertex {
-            position: positions[i],
+            position,
             normal: *normals.get(i).unwrap_or(&[0.0, 0.0, 0.0]),
             uv: *uvs.get(i).unwrap_or(&[0.0, 0.0]),
         });
