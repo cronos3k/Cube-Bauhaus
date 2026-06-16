@@ -30,6 +30,10 @@ public class CubeRigIK : ModuleRules
 			"Core",
 			"CoreUObject",
 			"Engine",
+			// FBoneReference, FBoneContainer, AnimationRuntime helpers used by the
+			// component + AnimGraph runtime node.
+			"AnimationCore",
+			"AnimGraphRuntime",
 		});
 
 		// ── Third-party cube-rig-ffi ────────────────────────────────────────

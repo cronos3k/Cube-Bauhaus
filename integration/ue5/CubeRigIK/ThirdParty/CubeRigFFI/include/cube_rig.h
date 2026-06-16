@@ -100,6 +100,59 @@ int crf_solve_chain(
 );
 
 /*
+ * A capsule obstacle in model space: the set of points within `radius` of the
+ * segment from `a` to `b`. Mirrors cube_rig::collision::Capsule.
+ */
+typedef struct CrfCapsule {
+    float a[3];      /* segment start (x, y, z) */
+    float b[3];      /* segment end   (x, y, z) */
+    float radius;    /* sweep radius            */
+} CrfCapsule;
+
+/*
+ * Solve an IK chain to `target` exactly like crf_solve_chain, THEN push the
+ * chain's bone capsules out of the static `obstacles` and write every bone's
+ * final local rotation (x,y,z,w) into out_local_rotations.
+ *
+ * The solve half is identical to crf_solve_chain (shared code path), so with
+ * obstacle_count == 0 and a NULL obstacles pointer the result matches
+ * crf_solve_chain exactly.
+ *
+ * Parameters (the leading block matches crf_solve_chain)
+ *  parents, local_bind, bone_count, chain, chain_len, effector_bone, target,
+ *  prior, hinge_limits, iterations
+ *                      same meaning as crf_solve_chain. hinge_limits, when
+ *                      non-NULL, are applied to BOTH the solve and the avoidance.
+ *  obstacles           len = obstacle_count; static capsule obstacles. May be
+ *                      NULL only when obstacle_count == 0.
+ *  obstacle_count      number of obstacles (0 => behaves like crf_solve_chain).
+ *  bone_radius         capsule radius used for the chain's bones during avoidance.
+ *  avoid_iterations    obstacle push-out iterations (clamped to >= 1).
+ *  out_local_rotations len = bone_count*4; receives the final local rotation
+ *                      (x,y,z,w) of EVERY bone.
+ *
+ * Returns CRF_OK (0) on success, or a nonzero CRF_ERR_* code. Passing NULL
+ * obstacles with obstacle_count > 0 returns CRF_ERR_NULL_POINTER.
+ */
+int crf_solve_chain_avoid(
+    const uint64_t*   parents,
+    const float*      local_bind,
+    size_t            bone_count,
+    const uint64_t*   chain,
+    size_t            chain_len,
+    uint64_t          effector_bone,
+    const float       target[3],
+    const CrfPrior*   prior,
+    const float*      hinge_limits,
+    int               iterations,
+    const CrfCapsule* obstacles,
+    size_t            obstacle_count,
+    float             bone_radius,
+    int               avoid_iterations,
+    float             out_local_rotations[]
+);
+
+/*
  * Library version as a static, NUL-terminated C string. The pointer is valid for
  * the lifetime of the program; do not free it.
  */

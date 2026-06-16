@@ -25,6 +25,16 @@
 				"Linux",
 				"Mac"
 			]
+		},
+		{
+			"Name": "CubeRigIKEditor",
+			"Type": "UncookedOnly",
+			"LoadingPhase": "Default",
+			"WhitelistPlatforms": [
+				"Win64",
+				"Linux",
+				"Mac"
+			]
 		}
 	]
 }
