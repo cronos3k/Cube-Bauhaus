@@ -1,5 +1,5 @@
 [workspace]
-members = [".", "crates/cube-world", "crates/bbc-renderer"]
+members = [".", "crates/cube-world", "crates/bbc-renderer", "crates/cube-rig", "crates/cube-rig-ffi"]
 resolver = "2"
 
 [package]
@@ -17,6 +17,7 @@ path = "src/main.rs"
 [dependencies]
 cube-world   = { path = "crates/cube-world" }
 bbc-renderer = { path = "crates/bbc-renderer" }
+cube-rig     = { path = "crates/cube-rig" }
 
 winit  = "0.29"
 egui = "0.27"

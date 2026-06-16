@@ -14,6 +14,7 @@
 mod input;
 mod editor;
 mod screenshot;
+mod rig_panel;
 
 use std::time::Instant;
 
@@ -111,6 +112,11 @@ fn main() {
     let mut delete_queue: [Vec<GpuMesh>; 3] = [vec![], vec![], vec![]];
     let mut delete_frame: usize = 0;
 
+    // ── Rigging bay (toggle with B) ─────────────────────────────────────────────
+    let mut rig = rig_panel::RigBay::new();
+    let mut rig_wire_mesh: Option<GpuMesh> = None;
+    let mut rig_bone_mesh: Option<GpuMesh> = None;
+
     // ── Camera ────────────────────────────────────────────────────────────────
     let ws = editor.edit_world.world.world_size() as f32;
     // Try to spawn at a playerstart entity (etype 1 in Cube2), else center of map
@@ -203,6 +209,12 @@ fn main() {
                     m.destroy(&renderer.device, &renderer.memory);
                 }
                 if let Some(mut m) = crosshair_mesh.take() {
+                    m.destroy(&renderer.device, &renderer.memory);
+                }
+                if let Some(mut m) = rig_wire_mesh.take() {
+                    m.destroy(&renderer.device, &renderer.memory);
+                }
+                if let Some(mut m) = rig_bone_mesh.take() {
                     m.destroy(&renderer.device, &renderer.memory);
                 }
                 solid_mesh.destroy(&renderer.device, &renderer.memory);
@@ -410,6 +422,24 @@ fn main() {
                     camera.update_from_wasd(dir, dt, sprint);
                 }
 
+                // ── Rig bay toggle + click routing ────────────────────────────
+                if inp.just_pressed(KeyCode::KeyB) {
+                    rig.enabled = !rig.enabled;
+                    rig.ctrl.render_dirty = true; // force mesh rebuild/teardown
+                }
+                if rig.enabled && !ui_mode {
+                    let sz = window.inner_size();
+                    rig.handle_pointer(
+                        &camera,
+                        glam::Vec2::new(inp.cursor_x, inp.cursor_y),
+                        sz.width,
+                        sz.height,
+                        inp.lmb,
+                        inp.lmb_just_pressed,
+                        inp.lmb_just_released,
+                    );
+                }
+
                 // ── Editor update ─────────────────────────────────────────────
                 let mut mesh_needs_rebuild = editor.update(&inp, &camera);
 
@@ -493,6 +523,25 @@ fn main() {
                     }
                 }
 
+                // ── Rebuild rig-bay meshes when the controller is dirty ───────
+                if rig.take_dirty() {
+                    if let Some(old) = rig_wire_mesh.take() {
+                        delete_queue[delete_frame % 3].push(old);
+                    }
+                    if let Some(old) = rig_bone_mesh.take() {
+                        delete_queue[delete_frame % 3].push(old);
+                    }
+                    if rig.enabled && rig.ctrl.has_mesh() {
+                        let (wv, wi, bv, bi) = rig.take_render_data();
+                        if !wi.is_empty() {
+                            rig_wire_mesh = Some(renderer.upload_mesh(&wv, &wi));
+                        }
+                        if !bi.is_empty() {
+                            rig_bone_mesh = Some(renderer.upload_mesh(&bv, &bi));
+                        }
+                    }
+                }
+
                 // ── Build egui frame ──────────────────────────────────────────
                 let egui_input = egui_winit_state.take_egui_input(&window);
                 let egui_output = egui_ctx.run(egui_input, |ctx| {
@@ -500,7 +549,9 @@ fn main() {
                         ctx, &mut editor, &camera, ui_mode, show_wire,
                         vert_count, tri_count, current_fps,
                     );
+                    rig.ui(ctx);
                 });
+                rig.process_requests();
                 let egui_primitives = egui_ctx.tessellate(
                     egui_output.shapes,
                     egui_output.pixels_per_point,
@@ -535,6 +586,17 @@ fn main() {
                 if let Some(ref ov) = overlay_mesh {
                     renderer.bind_line_pipeline(cmd, frame);
                     renderer.draw_mesh(cmd, ov, &glam::Mat4::IDENTITY);
+                }
+
+                // Draw rig bay: weight-coloured wireframe + bone segments
+                if rig.enabled {
+                    renderer.bind_line_pipeline(cmd, frame);
+                    if let Some(ref m) = rig_wire_mesh {
+                        renderer.draw_mesh(cmd, m, &glam::Mat4::IDENTITY);
+                    }
+                    if let Some(ref m) = rig_bone_mesh {
+                        renderer.draw_mesh(cmd, m, &glam::Mat4::IDENTITY);
+                    }
                 }
 
                 // Draw crosshair in edit mode — rendered as a 3D cross

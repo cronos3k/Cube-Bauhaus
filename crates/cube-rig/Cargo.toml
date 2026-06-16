@@ -1,0 +1,29 @@
+[package]
+name = "cube-rig"
+version = "0.1.0"
+edition = "2021"
+description = "Skeletal rigging & skinning for Cube Bauhaus — import a mesh, bind vertices to bones, export skinned GLB/FBX"
+license = "MIT"
+
+[dependencies]
+glam       = { version = "0.25", features = ["bytemuck", "serde"] }
+bytemuck   = { version = "1.14", features = ["derive"] }
+serde      = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+tracing    = "0.1"
+
+# Importers
+gltf = { version = "1.4", default-features = false, features = ["import", "utils", "names"] }
+tobj = "4.0"
+
+# FBX import (best-effort; skeletal extraction is partial — see import/fbx.rs)
+fbxcel-dom = { version = "0.0.9", optional = true }
+
+[features]
+# FBX import is on by default. Its dependency tree is heavier and skeletal
+# extraction is best-effort; disable with `--no-default-features` if not needed.
+default = ["fbx-import"]
+fbx-import = ["dep:fbxcel-dom"]
+
+[dev-dependencies]
+approx = "0.5"
