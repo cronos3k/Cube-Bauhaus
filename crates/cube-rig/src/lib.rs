@@ -25,6 +25,7 @@ pub mod clip;
 pub mod collision;
 pub mod controller;
 pub mod export;
+pub mod extract;
 pub mod ik;
 pub mod import;
 pub mod limits;

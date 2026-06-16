@@ -10,8 +10,9 @@
 use std::collections::{HashMap, HashSet};
 use std::path::Path;
 
-use glam::Mat4;
+use glam::{Mat4, Quat, Vec3};
 
+use crate::anim::{AnimationClip, BoneTrack};
 use crate::mesh::{Influence, RigVertex, SkinnedMesh, VertexInfluences, MAX_INFLUENCES};
 use crate::skeleton::{Bone, Skeleton};
 
@@ -72,7 +73,13 @@ pub fn import_gltf(path: &Path) -> Result<Imported, ImportError> {
 pub fn import_gltf_skeleton(path: &Path) -> Result<Option<Skeleton>, ImportError> {
     let (doc, _buffers, _images) =
         gltf::import(path).map_err(|e| ImportError::Parse(e.to_string()))?;
+    Ok(skeleton_with_node_map(&doc).map(|(sk, _)| sk))
+}
 
+/// Build the skeleton from a document's first skin and return it together with
+/// the node-index → bone-index map, sharing the exact joint ordering used by
+/// [`import_gltf_skeleton`] (so animation channels remap consistently).
+fn skeleton_with_node_map(doc: &gltf::Document) -> Option<(Skeleton, HashMap<usize, u16>)> {
     let node_count = doc.nodes().count();
     let mut local = vec![Mat4::IDENTITY; node_count];
     let mut parent = vec![None; node_count];
@@ -91,10 +98,88 @@ pub fn import_gltf_skeleton(path: &Path) -> Result<Option<Skeleton>, ImportError
         m
     };
 
-    match doc.skins().next() {
-        Some(skin) => Ok(build_skeleton(&skin, &parent, &global_of).0),
-        None => Ok(None),
+    let skin = doc.skins().next()?;
+    let (skeleton, node_to_bone) = build_skeleton_mapped(&skin, &parent, &global_of);
+    skeleton.map(|sk| (sk, node_to_bone))
+}
+
+/// Import all animations from a glTF/GLB file as [`AnimationClip`]s, keyed to the
+/// same joint ordering as [`import_gltf_skeleton`].
+///
+/// Channels targeting non-joint nodes are skipped. All samplers are treated as
+/// linear keyframe tracks (the interpolation our [`crate::anim`] sampler
+/// expects); unsupported interpolation modes are read as plain keyframes.
+pub fn import_gltf_animations(path: &Path) -> Result<Vec<AnimationClip>, ImportError> {
+    let (doc, buffers, _images) =
+        gltf::import(path).map_err(|e| ImportError::Parse(e.to_string()))?;
+
+    // Node→bone mapping identical to the skeleton importer. If the file has no
+    // skin, there are no joints to key animations against.
+    let node_to_bone = match skeleton_with_node_map(&doc) {
+        Some((_, map)) => map,
+        None => return Ok(Vec::new()),
+    };
+
+    let mut clips = Vec::new();
+    for (ai, animation) in doc.animations().enumerate() {
+        let name = animation
+            .name()
+            .map(str::to_owned)
+            .unwrap_or_else(|| format!("animation{ai}"));
+
+        // Accumulate one BoneTrack per bone, gathering its T/R/S channels.
+        let mut tracks: HashMap<u16, BoneTrack> = HashMap::new();
+        for channel in animation.channels() {
+            let target_node = channel.target().node().index();
+            let Some(&bone) = node_to_bone.get(&target_node) else {
+                continue; // channel targets a non-joint node
+            };
+
+            let reader = channel.reader(|b| Some(&buffers[b.index()].0));
+            let Some(times) = reader.read_inputs() else {
+                continue;
+            };
+            let times: Vec<f32> = times.collect();
+
+            let Some(outputs) = reader.read_outputs() else {
+                continue;
+            };
+
+            let track = tracks.entry(bone).or_insert_with(|| BoneTrack::new(bone));
+            match outputs {
+                gltf::animation::util::ReadOutputs::Translations(it) => {
+                    track.translation = times
+                        .iter()
+                        .copied()
+                        .zip(it.map(Vec3::from_array))
+                        .collect();
+                }
+                gltf::animation::util::ReadOutputs::Rotations(it) => {
+                    track.rotation = times
+                        .iter()
+                        .copied()
+                        .zip(it.into_f32().map(Quat::from_array))
+                        .collect();
+                }
+                gltf::animation::util::ReadOutputs::Scales(it) => {
+                    track.scale = times
+                        .iter()
+                        .copied()
+                        .zip(it.map(Vec3::from_array))
+                        .collect();
+                }
+                // Morph-target weights are not part of a BoneTrack.
+                gltf::animation::util::ReadOutputs::MorphTargetWeights(_) => {}
+            }
+        }
+
+        // Emit tracks in stable bone order for determinism.
+        let mut tracks: Vec<BoneTrack> = tracks.into_values().collect();
+        tracks.sort_by_key(|t| t.bone);
+        clips.push(AnimationClip { name, tracks });
     }
+
+    Ok(clips)
 }
 
 /// Build a [`Skeleton`] from a glTF skin. Returns the skeleton and a map from
@@ -105,6 +190,34 @@ fn build_skeleton(
     parent: &[Option<usize>],
     global_of: &impl Fn(usize) -> Mat4,
 ) -> (Option<Skeleton>, HashMap<u16, u16>) {
+    let (skeleton, node_to_bone) = build_skeleton_mapped(skin, parent, global_of);
+    let orig_to_bone = if skeleton.is_some() {
+        orig_joint_map(skin, &node_to_bone)
+    } else {
+        HashMap::new()
+    };
+    (skeleton, orig_to_bone)
+}
+
+/// Map each skin joint-array index → final bone index, using the node→bone map.
+fn orig_joint_map(skin: &gltf::Skin, node_to_bone: &HashMap<usize, u16>) -> HashMap<u16, u16> {
+    let mut orig_to_bone = HashMap::new();
+    for (orig, node) in skin.joints().enumerate() {
+        if let Some(&bone) = node_to_bone.get(&node.index()) {
+            orig_to_bone.insert(orig as u16, bone);
+        }
+    }
+    orig_to_bone
+}
+
+/// Build a [`Skeleton`] from a glTF skin and return the node-index → bone-index
+/// map. This is the single source of truth for joint ordering shared by the
+/// skeleton and animation importers.
+fn build_skeleton_mapped(
+    skin: &gltf::Skin,
+    parent: &[Option<usize>],
+    global_of: &impl Fn(usize) -> Mat4,
+) -> (Option<Skeleton>, HashMap<usize, u16>) {
     let joint_nodes: Vec<usize> = skin.joints().map(|n| n.index()).collect();
     if joint_nodes.is_empty() {
         return (None, HashMap::new());
@@ -144,13 +257,7 @@ fn build_skeleton(
         skeleton.add(Bone::new(name, parent_bone, local_bind));
     }
 
-    // Map original joint-array index → final bone index.
-    let mut orig_to_bone = HashMap::new();
-    for (orig, &node) in joint_nodes.iter().enumerate() {
-        orig_to_bone.insert(orig as u16, node_to_bone[&node]);
-    }
-
-    (Some(skeleton), orig_to_bone)
+    (Some(skeleton), node_to_bone)
 }
 
 /// Order nodes so each parent precedes its children (Kahn-style, stable).
