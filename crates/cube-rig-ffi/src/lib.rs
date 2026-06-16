@@ -194,17 +194,70 @@ unsafe fn solve_chain_inner(
     iterations: c_int,
     out_local_rotations: *mut f32,
 ) -> c_int {
-    // Null checks for all required buffers.
-    if parents.is_null()
-        || local_bind.is_null()
-        || chain.is_null()
-        || target.is_null()
-        || out_local_rotations.is_null()
-    {
+    if out_local_rotations.is_null() {
         return CRF_ERR_NULL_POINTER;
     }
+    // Run the shared validate + rebuild + solve path.
+    let (skeleton, pose, _chain_idx, _limits) = match unsafe {
+        solve_into(
+            parents,
+            local_bind,
+            bone_count,
+            chain,
+            chain_len,
+            effector_bone,
+            target,
+            prior,
+            hinge_limits,
+            iterations,
+        )
+    } {
+        Ok(v) => v,
+        Err(code) => return code,
+    };
+
+    // Write every bone's solved local rotation (xyzw) into the output buffer.
+    unsafe { write_local_rotations(&pose, &skeleton, out_local_rotations) };
+
+    CRF_OK
+}
+
+/// The solved data shared between the plain and obstacle-aware entrypoints: the
+/// rebuilt skeleton, the solved pose, the translated chain indices, and the
+/// decoded optional hinge limits.
+type SolveResult = (Skeleton, Pose, Vec<usize>, Option<Vec<Option<JointLimit>>>);
+
+/// Shared core for [`crf_solve_chain`] and [`crf_solve_chain_avoid`]: validate
+/// the flat inputs, rebuild the [`Skeleton`], decode the optional hinge limits,
+/// run [`solve_dls`], and hand back the solved `(Skeleton, Pose)` together with
+/// the translated chain indices and decoded limits so the caller can do further
+/// work (e.g. obstacle avoidance) against the exact same data.
+///
+/// Returns `Err(code)` with the appropriate `CRF_ERR_*` on any bad input so both
+/// entrypoints reject identically and cannot drift.
+///
+/// # Safety
+/// All non-null pointers must satisfy the buffer-length contract documented on
+/// [`crf_solve_chain`].
+#[allow(clippy::too_many_arguments)]
+unsafe fn solve_into(
+    parents: *const u64,
+    local_bind: *const f32,
+    bone_count: usize,
+    chain: *const u64,
+    chain_len: usize,
+    effector_bone: u64,
+    target: *const f32,
+    prior: *const CrfPrior,
+    hinge_limits: *const f32,
+    iterations: c_int,
+) -> Result<SolveResult, c_int> {
+    // Null checks for all required buffers.
+    if parents.is_null() || local_bind.is_null() || chain.is_null() || target.is_null() {
+        return Err(CRF_ERR_NULL_POINTER);
+    }
     if bone_count == 0 || chain_len == 0 {
-        return CRF_ERR_INVALID_ARG;
+        return Err(CRF_ERR_INVALID_ARG);
     }
 
     let parents = unsafe { std::slice::from_raw_parts(parents, bone_count) };
@@ -221,7 +274,7 @@ unsafe fn solve_chain_inner(
             let pu = p as usize;
             // Topological order is required by the solver's global() recursion.
             if pu >= bone_count || pu >= i {
-                return CRF_ERR_BAD_SKELETON;
+                return Err(CRF_ERR_BAD_SKELETON);
             }
             Some(pu)
         };
@@ -231,7 +284,7 @@ unsafe fn solve_chain_inner(
         skeleton.add(Bone::new(format!("b{i}"), parent, m));
     }
     if skeleton.validate().is_err() {
-        return CRF_ERR_BAD_SKELETON;
+        return Err(CRF_ERR_BAD_SKELETON);
     }
 
     // Translate the chain indices, bounds-checking each.
@@ -239,13 +292,13 @@ unsafe fn solve_chain_inner(
     for &c in chain_raw {
         let ci = c as usize;
         if c == CRF_NO_PARENT || ci >= bone_count {
-            return CRF_ERR_INVALID_ARG;
+            return Err(CRF_ERR_INVALID_ARG);
         }
         chain_idx.push(ci);
     }
     let effector = effector_bone as usize;
     if effector_bone == CRF_NO_PARENT || effector >= bone_count {
-        return CRF_ERR_INVALID_ARG;
+        return Err(CRF_ERR_INVALID_ARG);
     }
 
     let target_v = Vec3::new(target_raw[0], target_raw[1], target_raw[2]);
@@ -296,8 +349,16 @@ unsafe fn solve_chain_inner(
         &params,
     );
 
-    // Write every bone's solved local rotation (xyzw) into the output buffer.
-    let out = unsafe { std::slice::from_raw_parts_mut(out_local_rotations, bone_count * 4) };
+    Ok((skeleton, pose, chain_idx, limits))
+}
+
+/// Write every bone's solved local rotation (xyzw) from `pose` into the
+/// caller-provided `out` buffer (`skeleton.len() * 4` floats).
+///
+/// # Safety
+/// `out` must point to a writable buffer of at least `skeleton.len() * 4` floats.
+unsafe fn write_local_rotations(pose: &Pose, skeleton: &Skeleton, out: *mut f32) {
+    let out = unsafe { std::slice::from_raw_parts_mut(out, skeleton.len() * 4) };
     for (i, m) in pose.local.iter().enumerate() {
         let q: Quat = m.to_scale_rotation_translation().1;
         out[i * 4] = q.x;
@@ -305,6 +366,163 @@ unsafe fn solve_chain_inner(
         out[i * 4 + 2] = q.z;
         out[i * 4 + 3] = q.w;
     }
+}
+
+// ── Obstacle-aware solve entrypoint ─────────────────────────────────────────
+
+/// A capsule obstacle in model space: the set of points within `radius` of the
+/// segment from `a` to `b`. Mirrors `cube_rig::collision::Capsule` and the
+/// `CrfCapsule` struct in `cube_rig.h`.
+#[repr(C)]
+pub struct CrfCapsule {
+    /// Segment start (x, y, z).
+    pub a: [f32; 3],
+    /// Segment end (x, y, z).
+    pub b: [f32; 3],
+    /// Sweep radius.
+    pub radius: f32,
+}
+
+/// Solve an IK chain to `target` exactly like [`crf_solve_chain`], THEN push the
+/// chain's bone capsules out of the static `obstacles` using the collision
+/// resolver, writing every bone's final local rotation (xyzw) into
+/// `out_local_rotations`.
+///
+/// The solve half shares the *exact* same code path as [`crf_solve_chain`] (both
+/// call the private `solve_into` helper), so with `obstacle_count == 0` and a
+/// null `obstacles` pointer the result is identical to `crf_solve_chain`.
+///
+/// After solving, each bone in `chain` is approximated by a capsule of radius
+/// `bone_radius` and rotated out of the `obstacles` via
+/// `cube_rig::collision::avoid_obstacles` (running `avoid_iterations`, clamped to
+/// `>= 1`). The optional `hinge_limits` are decoded once and applied to both the
+/// solve and the avoidance step.
+///
+/// Returns [`CRF_OK`] on success or a nonzero `CRF_ERR_*` code. `obstacles` may
+/// be null only when `obstacle_count == 0`.
+///
+/// # Safety
+/// Same buffer-length contract as [`crf_solve_chain`], plus: when
+/// `obstacle_count > 0`, `obstacles` must point to `obstacle_count` `CrfCapsule`s.
+#[no_mangle]
+#[allow(clippy::too_many_arguments)]
+pub unsafe extern "C" fn crf_solve_chain_avoid(
+    parents: *const u64,
+    local_bind: *const f32,
+    bone_count: usize,
+    chain: *const u64,
+    chain_len: usize,
+    effector_bone: u64,
+    target: *const f32,
+    prior: *const CrfPrior,
+    hinge_limits: *const f32,
+    iterations: c_int,
+    obstacles: *const CrfCapsule,
+    obstacle_count: usize,
+    bone_radius: f32,
+    avoid_iterations: c_int,
+    out_local_rotations: *mut f32,
+) -> c_int {
+    let result = catch_unwind(AssertUnwindSafe(|| unsafe {
+        solve_chain_avoid_inner(
+            parents,
+            local_bind,
+            bone_count,
+            chain,
+            chain_len,
+            effector_bone,
+            target,
+            prior,
+            hinge_limits,
+            iterations,
+            obstacles,
+            obstacle_count,
+            bone_radius,
+            avoid_iterations,
+            out_local_rotations,
+        )
+    }));
+    result.unwrap_or(CRF_ERR_PANIC)
+}
+
+/// The actual obstacle-aware solve, factored out so `crf_solve_chain_avoid` is
+/// just the panic guard.
+///
+/// # Safety
+/// Same contract as [`crf_solve_chain_avoid`].
+#[allow(clippy::too_many_arguments)]
+unsafe fn solve_chain_avoid_inner(
+    parents: *const u64,
+    local_bind: *const f32,
+    bone_count: usize,
+    chain: *const u64,
+    chain_len: usize,
+    effector_bone: u64,
+    target: *const f32,
+    prior: *const CrfPrior,
+    hinge_limits: *const f32,
+    iterations: c_int,
+    obstacles: *const CrfCapsule,
+    obstacle_count: usize,
+    bone_radius: f32,
+    avoid_iterations: c_int,
+    out_local_rotations: *mut f32,
+) -> c_int {
+    if out_local_rotations.is_null() {
+        return CRF_ERR_NULL_POINTER;
+    }
+    // Obstacles may only be null when there are none.
+    if obstacles.is_null() && obstacle_count != 0 {
+        return CRF_ERR_NULL_POINTER;
+    }
+
+    // Run the same validate + rebuild + solve path as crf_solve_chain.
+    let (skeleton, mut pose, chain_idx, limits) = match unsafe {
+        solve_into(
+            parents,
+            local_bind,
+            bone_count,
+            chain,
+            chain_len,
+            effector_bone,
+            target,
+            prior,
+            hinge_limits,
+            iterations,
+        )
+    } {
+        Ok(v) => v,
+        Err(code) => return code,
+    };
+
+    // Push the chain out of the obstacles. With no obstacles this is a no-op and
+    // the result matches crf_solve_chain exactly.
+    if obstacle_count != 0 {
+        let raw = unsafe { std::slice::from_raw_parts(obstacles, obstacle_count) };
+        let obstacles_vec: Vec<cube_rig::collision::Capsule> = raw
+            .iter()
+            .map(|c| cube_rig::collision::Capsule {
+                a: Vec3::new(c.a[0], c.a[1], c.a[2]),
+                b: Vec3::new(c.b[0], c.b[1], c.b[2]),
+                radius: c.radius,
+            })
+            .collect();
+        let _remaining = cube_rig::collision::avoid_obstacles(
+            &mut pose,
+            &skeleton,
+            &chain_idx,
+            bone_radius,
+            &obstacles_vec,
+            limits.as_deref(),
+            &cube_rig::collision::AvoidParams {
+                iterations: avoid_iterations.max(1) as usize,
+                ..cube_rig::collision::AvoidParams::default()
+            },
+        );
+    }
+
+    // Write every bone's final local rotation (xyzw) into the output buffer.
+    unsafe { write_local_rotations(&pose, &skeleton, out_local_rotations) };
 
     CRF_OK
 }
@@ -523,6 +741,280 @@ mod tests {
             )
         };
         assert_eq!(code, CRF_ERR_INVALID_ARG);
+    }
+
+    /// FK head position of an arbitrary bone `i` from returned local rotations.
+    fn fk_head(parents: &[u64], local_bind: &[f32], out_rot: &[f32], i: usize) -> Vec3 {
+        fk_effector(parents, local_bind, out_rot, i)
+    }
+
+    #[test]
+    fn solve_chain_avoid_no_obstacles_matches_solve_chain() {
+        let (parents, local_bind, bone_count, chain, effector) = planar_chain_arrays(3);
+        let target = [1.5f32, 1.0, 0.0];
+
+        let mut out_plain = vec![0.0f32; bone_count * 4];
+        let code = unsafe {
+            crf_solve_chain(
+                parents.as_ptr(),
+                local_bind.as_ptr(),
+                bone_count,
+                chain.as_ptr(),
+                chain.len(),
+                effector,
+                target.as_ptr(),
+                std::ptr::null(),
+                std::ptr::null(),
+                64,
+                out_plain.as_mut_ptr(),
+            )
+        };
+        assert_eq!(code, CRF_OK);
+
+        // No obstacles: null ptr + count 0 must behave identically.
+        let mut out_avoid = vec![0.0f32; bone_count * 4];
+        let code = unsafe {
+            crf_solve_chain_avoid(
+                parents.as_ptr(),
+                local_bind.as_ptr(),
+                bone_count,
+                chain.as_ptr(),
+                chain.len(),
+                effector,
+                target.as_ptr(),
+                std::ptr::null(),
+                std::ptr::null(),
+                64,
+                std::ptr::null(), // obstacles null
+                0,                // obstacle_count
+                0.28,
+                12,
+                out_avoid.as_mut_ptr(),
+            )
+        };
+        assert_eq!(code, CRF_OK);
+
+        for (a, b) in out_plain.iter().zip(out_avoid.iter()) {
+            assert!(a.is_finite() && b.is_finite());
+            assert!((a - b).abs() < 1e-6, "no-obstacle avoid must match plain: {a} vs {b}");
+        }
+    }
+
+    #[test]
+    fn solve_chain_avoid_pushes_off_obstacle() {
+        // 3-joint planar chain reaching past an obstacle planted on the naive
+        // solution's path (mirrors viz_demo's scenario B).
+        let (parents, local_bind, bone_count, chain, effector) = planar_chain_arrays(3);
+        let target = [2.6f32, 0.05, 0.0];
+
+        // Naive solve (no avoidance) to find where the arm lands.
+        let mut naive = vec![0.0f32; bone_count * 4];
+        let code = unsafe {
+            crf_solve_chain(
+                parents.as_ptr(),
+                local_bind.as_ptr(),
+                bone_count,
+                chain.as_ptr(),
+                chain.len(),
+                effector,
+                target.as_ptr(),
+                std::ptr::null(),
+                std::ptr::null(),
+                64,
+                naive.as_mut_ptr(),
+            )
+        };
+        assert_eq!(code, CRF_OK);
+
+        // Plant the obstacle on the midpoint of a mid-arm bone of the naive pose
+        // (heads of bones 1 and 2), swept through Z so the bone capsule truly
+        // penetrates it.
+        let h1 = fk_head(&parents, &local_bind, &naive, 1);
+        let h2 = fk_head(&parents, &local_bind, &naive, 2);
+        let mid = (h1 + h2) * 0.5;
+        let bone_radius = 0.28f32;
+        let obstacle = CrfCapsule {
+            a: [mid.x, mid.y, -0.7],
+            b: [mid.x, mid.y, 0.7],
+            radius: 0.4,
+        };
+
+        // Sanity: the naive pose actually penetrates the obstacle, otherwise the
+        // test would be vacuous. Rebuild a cube_rig pose to query collision.
+        let (sk, naive_pose) = rebuild_pose(&parents, &local_bind, &naive, bone_count);
+        let obs_cr = cube_rig::collision::Capsule {
+            a: Vec3::new(obstacle.a[0], obstacle.a[1], obstacle.a[2]),
+            b: Vec3::new(obstacle.b[0], obstacle.b[1], obstacle.b[2]),
+            radius: obstacle.radius,
+        };
+        let naive_pen = cube_rig::collision::bone_capsules(&naive_pose, &sk, bone_radius)
+            .iter()
+            .flatten()
+            .filter(|c| cube_rig::collision::capsule_penetration(c, &obs_cr).is_some())
+            .count();
+        assert!(naive_pen > 0, "obstacle must actually penetrate the naive arm");
+
+        // Now solve with avoidance.
+        let obstacles = [obstacle];
+        let mut out = vec![0.0f32; bone_count * 4];
+        let code = unsafe {
+            crf_solve_chain_avoid(
+                parents.as_ptr(),
+                local_bind.as_ptr(),
+                bone_count,
+                chain.as_ptr(),
+                chain.len(),
+                effector,
+                target.as_ptr(),
+                std::ptr::null(),
+                std::ptr::null(),
+                64,
+                obstacles.as_ptr(),
+                obstacles.len(),
+                bone_radius,
+                64, // avoid_iterations
+                out.as_mut_ptr(),
+            )
+        };
+        assert_eq!(code, CRF_OK);
+
+        // All outputs finite.
+        assert!(out.iter().all(|c| c.is_finite()), "all rotations must be finite");
+
+        // Rebuild the solved pose and assert ZERO bone capsules penetrate.
+        let (sk, solved_pose) = rebuild_pose(&parents, &local_bind, &out, bone_count);
+        let remaining = cube_rig::collision::bone_capsules(&solved_pose, &sk, bone_radius)
+            .iter()
+            .flatten()
+            .filter(|c| cube_rig::collision::capsule_penetration(c, &obs_cr).is_some())
+            .count();
+        assert_eq!(remaining, 0, "no bone capsule may penetrate the obstacle after avoidance");
+    }
+
+    #[test]
+    fn solve_chain_avoid_rejects_null_and_bad_args() {
+        let (parents, local_bind, bone_count, chain, effector) = planar_chain_arrays(2);
+        let target = [1.0f32, 0.0, 0.0];
+        let mut out = vec![0.0f32; bone_count * 4];
+
+        // Null out buffer → NULL_POINTER.
+        let code = unsafe {
+            crf_solve_chain_avoid(
+                parents.as_ptr(),
+                local_bind.as_ptr(),
+                bone_count,
+                chain.as_ptr(),
+                chain.len(),
+                effector,
+                target.as_ptr(),
+                std::ptr::null(),
+                std::ptr::null(),
+                16,
+                std::ptr::null(),
+                0,
+                0.28,
+                12,
+                std::ptr::null_mut(),
+            )
+        };
+        assert_eq!(code, CRF_ERR_NULL_POINTER);
+
+        // Null obstacles with a nonzero count → NULL_POINTER.
+        let code = unsafe {
+            crf_solve_chain_avoid(
+                parents.as_ptr(),
+                local_bind.as_ptr(),
+                bone_count,
+                chain.as_ptr(),
+                chain.len(),
+                effector,
+                target.as_ptr(),
+                std::ptr::null(),
+                std::ptr::null(),
+                16,
+                std::ptr::null(), // null obstacles
+                3,                // but count > 0
+                0.28,
+                12,
+                out.as_mut_ptr(),
+            )
+        };
+        assert_eq!(code, CRF_ERR_NULL_POINTER);
+
+        // Null required input pointer (parents) → NULL_POINTER.
+        let code = unsafe {
+            crf_solve_chain_avoid(
+                std::ptr::null(),
+                local_bind.as_ptr(),
+                bone_count,
+                chain.as_ptr(),
+                chain.len(),
+                effector,
+                target.as_ptr(),
+                std::ptr::null(),
+                std::ptr::null(),
+                16,
+                std::ptr::null(),
+                0,
+                0.28,
+                12,
+                out.as_mut_ptr(),
+            )
+        };
+        assert_eq!(code, CRF_ERR_NULL_POINTER);
+
+        // Out-of-range effector → INVALID_ARG.
+        let code = unsafe {
+            crf_solve_chain_avoid(
+                parents.as_ptr(),
+                local_bind.as_ptr(),
+                bone_count,
+                chain.as_ptr(),
+                chain.len(),
+                999,
+                target.as_ptr(),
+                std::ptr::null(),
+                std::ptr::null(),
+                16,
+                std::ptr::null(),
+                0,
+                0.28,
+                12,
+                out.as_mut_ptr(),
+            )
+        };
+        assert_eq!(code, CRF_ERR_INVALID_ARG);
+    }
+
+    /// Rebuild a `cube_rig` `Skeleton` + `Pose` from the flat FFI arrays and the
+    /// returned per-bone local rotations, so tests can query collision exactly as
+    /// the engine would on the data the FFI handed back.
+    fn rebuild_pose(
+        parents: &[u64],
+        local_bind: &[f32],
+        out_rot: &[f32],
+        bone_count: usize,
+    ) -> (Skeleton, Pose) {
+        let mut sk = Skeleton::new();
+        for (i, &p) in parents.iter().enumerate() {
+            let parent = if p == CRF_NO_PARENT { None } else { Some(p as usize) };
+            let m = Mat4::from_cols_array(
+                <&[f32; 16]>::try_from(&local_bind[i * 16..i * 16 + 16]).unwrap(),
+            );
+            sk.add(Bone::new(format!("b{i}"), parent, m));
+        }
+        let mut pose = Pose::from_bind(&sk);
+        for i in 0..bone_count {
+            let translation = pose.local[i].w_axis.truncate();
+            let q = Quat::from_xyzw(
+                out_rot[i * 4],
+                out_rot[i * 4 + 1],
+                out_rot[i * 4 + 2],
+                out_rot[i * 4 + 3],
+            );
+            pose.local[i] = Mat4::from_rotation_translation(q, translation);
+        }
+        (sk, pose)
     }
 
     #[test]
