@@ -412,6 +412,35 @@ generative motion source is present.
 > Motions with Modular Latent Generative Model and Smart Primitives.* ACM Trans.
 > Graph. 45(4), July 2026. arXiv:2604.24833. DOI 10.1145/3811334.
 
+### 12.1 Production evidence: the decoupled RL + IK split (GR00T-WBC)
+
+The complementary-layer framing is not hypothetical — it is how a shipping
+humanoid platform is built. NVIDIA's **GR00T Whole-Body Control** stack houses
+three subsystems (`gear_sonic/`, `motionbricks/`, and the **decoupled WBC** used
+in GR00T N1.5/N1.6). The decoupled controller is described verbatim as
+**"RL for lower body, and IK for upper body"**: a learned policy handles
+locomotion and balance (the bulk, dynamic, hard-to-author part), while
+**analytical inverse kinematics handles precise upper-body tasks** (reaching,
+manipulation, contact).
+
+This is the same division of labour proposed here, with the bulk-motion source
+swapped for an RL policy instead of a generative model:
+
+- **Bulk / balance layer** — learned (RL policy *or* generative backbone).
+- **Precision + guarantee layer** — analytical IK (this system) for exact
+  effector placement, hard joint limits, and self-collision.
+
+Our contribution sits squarely in that second slot, and adds what the GR00T-WBC
+README does not surface as explicit features: **data-driven goal-conditioned
+steering** of the IK (§6–7) and **capsule self-collision guarantees** (§8). The
+broader stack is trained on the **Bones-SEED** dataset (142K+ human motions,
+~288 hours, retargeted to the Unitree G1) — the same scale of corpus our offline
+extractor (§9) is designed to consume.
+
+> **Reference.** NVIDIA GEAR. *GR00T Whole-Body Control* (GEAR-SONIC,
+> MotionBricks, decoupled WBC). https://github.com/NVlabs/GR00T-WholeBodyControl
+> — decoupled controller: "RL for lower body, and IK for upper body."
+
 ---
 
 ## 13. Open Questions
