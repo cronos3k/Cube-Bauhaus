@@ -162,6 +162,24 @@ Per CCD iteration, for each joint from tip to root:
 3. **Layer 1:** clamp the result to the joint's hard limits.
 4. (Optionally) cheap-check capsule collision for early rejection.
 
+### 5.1 Reconsideration: damped least-squares with a weighted posture term
+
+CCD is the simplest rotation-space option, but dissecting a shipping system
+(NVIDIA GR00T-WBC's upper-body IK, §12.1) shows the soft bias has a *more
+natural* home: a **Jacobian / damped-least-squares (DLS) solver with the bias as
+a weighted secondary ("posture") task.** There, anisotropic compliance is a
+per-joint weight matrix on the secondary objective — exactly our `JointBias` —
+rather than something bolted onto a per-joint sweep. Their solver is literally a
+`FrameTask` (effector goal) + a `WeightedPostureTask` (per-joint weights) under
+joint-limit constraints, with Levenberg–Marquardt damping for unreachable
+targets.
+
+**Updated recommendation:** target a hand-rolled **DLS solver with a weighted
+posture nullspace** as the primary constrained solver (no heavy dependency, same
+shape as the production reference); keep CCD as the dependency-free fallback and
+FABRIK/`two_bone` for the fast unconstrained path. The layering above is
+unchanged — only the inner update rule differs.
+
 ---
 
 ## 6. Layer 2 — Soft Gradient Steering Field
@@ -294,25 +312,67 @@ guaranteed.
 
 ---
 
-## 9. Offline Corpus Extraction
+## 9. Offline Extraction — a Source-Agnostic Pipeline
 
-A standalone binary bakes the field from the motion corpus (run locally; ~9000
-clips is too large for a CI sandbox):
+The field is baked offline (run locally; a large corpus is too big for a CI
+sandbox). The central design decision is that **motion enters through one
+abstraction regardless of where it came from** — captured mocap, hand-keyed
+animation, or the *output* of a generative model. The extractor never knows or
+cares about the source.
 
-1. **Walk** a directory of clips → `import` (OBJ/glTF/FBX; **add BVH** if the
-   corpus is mocap-standard, since `import/` does not cover it today).
-2. **Retarget** each source skeleton to a canonical bone set via a name-alias
-   table (e.g. `mixamorig:LeftArm` ↔ `L_Shoulder`), expressing every rotation
-   **bone-local, relative to bind** so rest-pose differences cancel. (Assume
-   **mixed rigs**; for uniform corpora this is an identity pass.)
-3. **Sample** each `AnimationClip` at a fixed rate; convert each bone's local
-   quaternion to swing-twist; compute each frame's `GoalDescriptor`.
-4. **Accumulate** per-(goal-cell, joint) swing-twist usage histograms.
-5. **Bake** to a compact `MotionPrior` table — per cell, per joint a `JointBias`
+### 9.1 The `Clip` abstraction
+
+```rust
+pub struct Frame { pub root: Mat4, pub local_rotations: Vec<Quat> }   // per bone
+pub struct Clip  { pub name: String, pub frame_rate: f32, pub frames: Vec<Frame> }
+```
+
+Every source normalizes into `Clip`. From this single stream we derive
+*everything*: per-joint swing-twist → bias field (§6); empirical per-joint min/max
+→ data-tightened limits validating the physical ones (§4); forward kinematics →
+effector trajectories → goal descriptors (§7); inter-limb closest distances →
+which bones actually near-collide → selective capsule placement and radii (§8).
+None of it requires anything but the clip.
+
+### 9.2 The bake
+
+1. **Ingest** clips from any source into the `Clip` form (see §9.3). For external
+   rigs, **retarget** to a canonical bone set via a name-alias table
+   (`mixamorig:LeftArm` ↔ `L_Shoulder`), expressing rotations **bone-local,
+   relative to bind** so rest-pose differences cancel. (Assume **mixed rigs**;
+   for uniform corpora this is an identity pass.)
+2. **Decompose** each bone's local rotation to swing-twist; compute each frame's
+   `GoalDescriptor` by FK on the effector.
+3. **Accumulate** per-(goal-cell, joint) swing-twist usage statistics.
+4. **Bake** to a compact `MotionPrior` table — per cell, per joint a `JointBias`
    (v1) or weight grid (v2) — serialized alongside the app.
 
 Joints with insufficient samples fall back to the global cell, and ultimately to
 pure geometric IK (graceful degradation).
+
+### 9.3 Motion sources — and the generative model as an *oracle*
+
+Because the pipeline is source-agnostic, a trained generative motion model
+(e.g. a MotionBricks/SONIC-style backbone, §12) becomes **just another clip
+source — used through its output, never its weights.** We run the model, take the
+per-frame joint configuration `q(t)` it emits, normalize it into `Clip`, and
+distill exactly as we would from mocap. The runtime IK keeps **zero** neural
+dependency; the model only ever appears offline, as data.
+
+This is strictly better than a fixed corpus in one important way — **active
+sampling.** Raw mocap gives whatever motions happen to exist; a generator can be
+*queried*. We enumerate the goal-conditioned cells the IK will actually face
+(reach-high-left, pull-to-chest, vault, low-crawl…), drive the model's high-level
+commands to **each**, and synthesize as many clips per cell as we want. That turns
+§7's conditioning from "hope the corpus covers this cell" into "**synthesize
+exactly the data each cell needs**, uniformly, on demand." Passive corpus →
+active oracle.
+
+Practical notes: model output is typically already retargeted to a known skeleton
+and label-free, so ingestion is an identity pass; standing up a model's runtime
+has a setup cost (weigh it against the active-sampling payoff); and a model's
+*outputs* may be license-governed (e.g. NVIDIA Open Model License) — a one-time
+check before a distilled prior ships in a product, not a runtime concern.
 
 ---
 
@@ -320,12 +380,14 @@ pure geometric IK (graceful degradation).
 
 | Type | Module | Role |
 |---|---|---|
-| `JointLimits` | `limits.rs` | Hard per-axis swing-twist bounds |
+| `Clip` / `Frame` | `clip.rs` | Source-agnostic motion (mocap / keyed / model output) |
+| `JointLimit` | `limits.rs` | Hard limits: `Hinge{axis,min,max}` **or** `SwingTwist` cone |
 | `JointBias` | `prior.rs` | Soft per-joint anisotropic steering bias |
 | `GoalDescriptor` | `prior.rs` | Body-relative conditioning variable |
+| `MotionPriorBuilder` | `prior.rs` | Accumulates clip statistics → bakes a `MotionPrior` |
 | `MotionPrior` | `prior.rs` | Goal-cell → joint → bias lookup table |
 | `Capsule` | `collision.rs` | Per-bone collision volume |
-| `ik::ccd` | `ik.rs` | Rotation-space solver honoring all layers |
+| `ik::solve` | `ik.rs` | Constrained solver honoring all layers (see §5) |
 
 ---
 
