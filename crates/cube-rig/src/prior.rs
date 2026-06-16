@@ -6,10 +6,15 @@
 //! rotation to relax toward. It is built from [`Clip`](crate::clip::Clip)s by
 //! [`MotionPriorBuilder`], which accumulates per-bone rotation statistics.
 //!
-//! The lookup is **goal-conditioned by design**: [`MotionPrior::bias`] already
-//! takes a [`GoalDescriptor`] (a body-relative target/approach/action triple) so
-//! callers wire against the final API now. The current v1 prior stores a single
-//! global bucket and ignores the goal; v2 will index a goal-conditioned grid.
+//! The lookup is **goal-conditioned by design**: [`MotionPrior::bias`] takes a
+//! [`GoalDescriptor`] (a body-relative target/approach/action triple). v2 keeps a
+//! `global` fallback bucket AND a [`HashMap`](std::collections::HashMap) of
+//! goal-conditioned cells: the same joint is steered differently depending on
+//! where the effector goal sits relative to the body. See [`goal_cell`] for the
+//! quantization scheme. A v1-baked prior (global only, empty `cells`) keeps
+//! working unchanged — `bias` falls back to `global`.
+
+use std::collections::HashMap;
 
 use glam::{Quat, Vec3};
 use serde::{Deserialize, Serialize};
@@ -46,6 +51,62 @@ pub struct GoalDescriptor {
     pub action_tag: Option<u16>,
 }
 
+/// Number of radial distance shells used by [`goal_cell`].
+const NUM_SHELLS: u32 = 3;
+/// Upper bound (exclusive) of shell 0, in body-local units. Below this the goal
+/// is "near"; from here to [`SHELL_FAR`] it is "mid"; beyond it is "far".
+const SHELL_NEAR: f32 = 0.5;
+const SHELL_FAR: f32 = 1.5;
+/// The cell id reserved for a zero-length (undefined-direction) target.
+pub const FALLBACK_CELL: u32 = u32::MAX;
+
+/// Quantize a [`GoalDescriptor`] into a coarse, deterministic cell id.
+///
+/// The scheme buckets the body-relative target [`GoalDescriptor::target_local`]
+/// along two coarse axes:
+///
+/// * **Direction** → one of 6 sectors by the dominant signed axis of the
+///   *direction* (the component with the largest magnitude): `+X,-X,+Y,-Y,+Z,-Z`
+///   mapped to sector ids `0..6`.
+/// * **Distance** → one of [`NUM_SHELLS`] radial shells by `target_local.length()`
+///   against the fixed thresholds [`SHELL_NEAR`] and [`SHELL_FAR`]: shell `0` is
+///   `len < SHELL_NEAR`, shell `1` is `SHELL_NEAR..SHELL_FAR`, shell `2` is
+///   `len >= SHELL_FAR`.
+///
+/// The two are combined as `sector * NUM_SHELLS + shell`, yielding `0..18`.
+///
+/// A zero-length target (no well-defined direction) maps to [`FALLBACK_CELL`].
+pub fn goal_cell(goal: &GoalDescriptor) -> u32 {
+    let t = goal.target_local;
+    let len = t.length();
+    if len < 1e-6 {
+        return FALLBACK_CELL;
+    }
+
+    // Dominant signed axis → sector 0..6.
+    let (ax, ay, az) = (t.x.abs(), t.y.abs(), t.z.abs());
+    let sector = if ax >= ay && ax >= az {
+        if t.x >= 0.0 { 0 } else { 1 }
+    } else if ay >= az {
+        if t.y >= 0.0 { 2 } else { 3 }
+    } else if t.z >= 0.0 {
+        4
+    } else {
+        5
+    };
+
+    // Radial shell 0..NUM_SHELLS.
+    let shell = if len < SHELL_NEAR {
+        0
+    } else if len < SHELL_FAR {
+        1
+    } else {
+        2
+    };
+
+    sector * NUM_SHELLS + shell
+}
+
 /// Per-bone steering bias: how compliant the joint is per axis, plus the pose it
 /// relaxes toward.
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -65,50 +126,69 @@ impl Default for JointBias {
 
 /// A goal-conditioned motion prior.
 ///
-/// v1: one global [`JointBias`] per bone. The [`bias`](MotionPrior::bias) lookup
-/// already accepts a [`GoalDescriptor`] but ignores it for now.
+/// Holds a `global` per-bone bucket (the goal-agnostic fallback) plus a map of
+/// goal-conditioned `cells` keyed by [`goal_cell`]. The
+/// [`bias`](MotionPrior::bias) lookup prefers the cell matching the goal and
+/// falls back to `global` (then to [`JointBias::default`]) when a cell lacks data
+/// for the requested bone.
+///
+/// A v1-baked prior has data only in `global` and an empty `cells` map; it
+/// behaves exactly as before. The `cells` field is `#[serde(default)]` so older
+/// JSON without it still deserializes.
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct MotionPrior {
-    /// Per-bone bias for the single global goal bucket. Bones outside this vector
-    /// (or with no observations) fall back to [`JointBias::default`].
-    per_bone: Vec<JointBias>,
+    /// Per-bone bias for the goal-agnostic global bucket. Bones outside this
+    /// vector (or with no observations) fall back to [`JointBias::default`].
+    global: Vec<JointBias>,
+    /// Goal-conditioned cells: cell id (from [`goal_cell`]) → per-bone bias.
+    /// A cell only holds bones that had enough samples; missing bones fall back
+    /// to `global`.
+    #[serde(default)]
+    cells: HashMap<u32, Vec<JointBias>>,
 }
 
 impl MotionPrior {
     /// Steering bias for `bone` under `goal`.
     ///
-    /// Returns the graceful default ([`Vec3::ONE`] weights, identity preferred)
-    /// when the bone has no recorded data.
-    pub fn bias(&self, bone: usize, _goal: &GoalDescriptor) -> JointBias {
-        // TODO: goal-conditioned cells — index a per-goal grid using `goal`.
-        self.per_bone.get(bone).cloned().unwrap_or_default()
+    /// Resolves the goal's cell via [`goal_cell`] and returns the cell's per-bone
+    /// bias when that cell has recorded data for `bone`; otherwise falls back to
+    /// the `global` bucket, then to the graceful default ([`Vec3::ONE`] weights,
+    /// identity preferred) when no data exists at all.
+    pub fn bias(&self, bone: usize, goal: &GoalDescriptor) -> JointBias {
+        let cell = goal_cell(goal);
+        if let Some(bias) = self.cells.get(&cell).and_then(|v| v.get(bone)) {
+            return bias.clone();
+        }
+        self.global.get(bone).cloned().unwrap_or_default()
     }
 
-    /// Number of bones with recorded bias data.
+    /// Number of bones with recorded bias data in the global bucket.
     pub fn len(&self) -> usize {
-        self.per_bone.len()
+        self.global.len()
     }
 
-    /// Whether the prior holds no bone data.
+    /// Whether the prior holds no global bone data.
     pub fn is_empty(&self) -> bool {
-        self.per_bone.is_empty()
+        self.global.is_empty()
+    }
+
+    /// Number of goal-conditioned cells with recorded data.
+    pub fn num_cells(&self) -> usize {
+        self.cells.len()
     }
 }
 
-/// Running per-bone statistics accumulator over one or more clips.
+/// Running per-bone swing-twist statistics for one bucket (the global bucket or
+/// a single goal-conditioned cell).
 ///
 /// For each observed local rotation we decompose it (about a per-bone twist
-/// axis, default `Vec3::Y` for v1) and accumulate a running mean quaternion plus
-/// per-axis angle variance. On [`build`](MotionPriorBuilder::build) the variance
-/// becomes a normalized inverse-stiffness proxy: high-variance axes are deemed
-/// more compliant and get a larger `axis_weight`.
-///
-/// v1 keeps a single scalar weight per axis; v2 would replace this with a
-/// swing-twist grid keyed by goal.
-pub struct MotionPriorBuilder {
+/// axis) and accumulate a running mean quaternion plus per-axis angle variance.
+/// On [`finalize`](BoneAccumulator::finalize) the variance becomes a normalized
+/// inverse-stiffness proxy: high-variance axes are deemed more compliant and get
+/// a larger `axis_weight`.
+#[derive(Clone)]
+struct BoneAccumulator {
     num_bones: usize,
-    /// Twist axis per bone (default `Vec3::Y`).
-    twist_axis: Vec<Vec3>,
     /// Sample count per bone.
     count: Vec<u32>,
     /// Running mean rotation per bone (sign-aligned average, renormalized).
@@ -118,12 +198,10 @@ pub struct MotionPriorBuilder {
     sum_sq_angles: Vec<Vec3>,
 }
 
-impl MotionPriorBuilder {
-    /// A fresh builder for a skeleton of `num_bones` bones.
-    pub fn new(num_bones: usize) -> Self {
+impl BoneAccumulator {
+    fn new(num_bones: usize) -> Self {
         Self {
             num_bones,
-            twist_axis: vec![Vec3::Y; num_bones],
             count: vec![0; num_bones],
             mean: vec![Quat::IDENTITY; num_bones],
             sum_angles: vec![Vec3::ZERO; num_bones],
@@ -131,27 +209,9 @@ impl MotionPriorBuilder {
         }
     }
 
-    /// Override the twist axis used to decompose `bone`'s rotations.
-    pub fn set_twist_axis(&mut self, bone: usize, axis: Vec3) {
-        if bone < self.num_bones {
-            self.twist_axis[bone] = axis.normalize_or_zero();
-        }
-    }
-
-    /// Accumulate statistics from every frame of `clip`.
-    pub fn add_clip(&mut self, clip: &crate::clip::Clip) {
-        for frame in &clip.frames {
-            for (bone, &rot) in frame.local_rotations.iter().enumerate() {
-                if bone >= self.num_bones {
-                    break;
-                }
-                self.observe(bone, rot);
-            }
-        }
-    }
-
-    /// Fold one rotation observation into bone `bone`'s running statistics.
-    fn observe(&mut self, bone: usize, rot: Quat) {
+    /// Fold one rotation observation into bone `bone`'s running statistics,
+    /// decomposed about `axis`.
+    fn observe(&mut self, bone: usize, rot: Quat, axis: Vec3) {
         let n = self.count[bone];
 
         // Running mean quaternion with sign alignment: flip `rot` into the same
@@ -174,7 +234,6 @@ impl MotionPriorBuilder {
 
         // Per-axis angle samples from the swing-twist decomposition: the twist
         // angle about the bone axis, and two swing angles in the ⟂ plane.
-        let axis = self.twist_axis[bone];
         let (swing, twist) = swing_twist(rot, axis);
         let twist_angle = signed_angle_about(twist, axis);
         let (sx, sy) = swing_components(swing, axis);
@@ -186,49 +245,201 @@ impl MotionPriorBuilder {
         self.count[bone] = n + 1;
     }
 
-    /// Finalize the accumulated statistics into a [`MotionPrior`].
-    pub fn build(self) -> MotionPrior {
-        let mut per_bone = Vec::with_capacity(self.num_bones);
+    /// Per-bone per-axis variance (`Vec3::ZERO` for bones with < 2 samples).
+    fn variances(&self) -> Vec<Vec3> {
+        (0..self.num_bones)
+            .map(|bone| {
+                let n = self.count[bone];
+                if n < 2 {
+                    Vec3::ZERO
+                } else {
+                    let nf = n as f32;
+                    let mean = self.sum_angles[bone] / nf;
+                    // E[x²] − E[x]² per component, clamped non-negative.
+                    let mean_sq = self.sum_sq_angles[bone] / nf;
+                    (mean_sq - mean * mean).max(Vec3::ZERO)
+                }
+            })
+            .collect()
+    }
 
-        // First pass: per-bone per-axis variance.
-        let mut variances = Vec::with_capacity(self.num_bones);
-        for bone in 0..self.num_bones {
-            let n = self.count[bone];
-            let var = if n < 2 {
-                Vec3::ZERO
-            } else {
-                let nf = n as f32;
-                let mean = self.sum_angles[bone] / nf;
-                // E[x²] − E[x]² per component, clamped non-negative.
-                let mean_sq = self.sum_sq_angles[bone] / nf;
-                (mean_sq - mean * mean).max(Vec3::ZERO)
-            };
-            variances.push(var);
-        }
-
+    /// Finalize into a per-bone bias vector spanning all bones (for index
+    /// stability). Bones with `count < min_samples` get [`JointBias::default`],
+    /// so cell lookups for those bones fall back to the global bucket.
+    fn finalize(&self, min_samples: u32) -> Vec<JointBias> {
+        let variances = self.variances();
         // Normalize variance into a compliance weight: higher variance ⇒ larger
-        // weight. We scale by the global max so weights land in a tame range and
-        // floor at 1.0 so the default (no data) stays comparable.
+        // weight. We scale by the max so weights land in a tame range and floor
+        // at 1.0 so the default (no data) stays comparable.
         let max_var = variances
             .iter()
             .flat_map(|v| [v.x, v.y, v.z])
             .fold(0.0_f32, f32::max);
 
-        for (bone, &v) in variances.iter().enumerate() {
-            if self.count[bone] == 0 {
-                per_bone.push(JointBias::default());
-                continue;
-            }
-            // 1.0 baseline + variance-proportional bonus (normalized by max_var).
-            let axis_weight = if max_var > 1e-9 {
-                Vec3::ONE + v / max_var
-            } else {
-                Vec3::ONE
-            };
-            per_bone.push(JointBias { axis_weight, preferred: self.mean[bone] });
-        }
+        variances
+            .iter()
+            .enumerate()
+            .map(|(bone, &v)| {
+                if self.count[bone] < min_samples {
+                    return JointBias::default();
+                }
+                // 1.0 baseline + variance-proportional bonus (normalized).
+                let axis_weight = if max_var > 1e-9 {
+                    Vec3::ONE + v / max_var
+                } else {
+                    Vec3::ONE
+                };
+                JointBias { axis_weight, preferred: self.mean[bone] }
+            })
+            .collect()
+    }
 
-        MotionPrior { per_bone }
+    /// Whether any bone has at least `min_samples` samples.
+    fn any_dense(&self, min_samples: u32) -> bool {
+        self.count.iter().any(|&c| c >= min_samples)
+    }
+}
+
+/// Running per-bone statistics accumulator over one or more clips.
+///
+/// Keeps a goal-agnostic `global` accumulator (fed by [`add_clip`] and
+/// [`add_clip_with_goal`]) plus per-cell accumulators keyed by [`goal_cell`]
+/// (fed only by [`add_clip_with_goal`]). On [`build`](MotionPriorBuilder::build)
+/// the global bucket finalizes as before and each cell with enough samples
+/// finalizes into the prior's `cells` map.
+///
+/// [`add_clip`]: MotionPriorBuilder::add_clip
+/// [`add_clip_with_goal`]: MotionPriorBuilder::add_clip_with_goal
+pub struct MotionPriorBuilder {
+    num_bones: usize,
+    /// Twist axis per bone (default `Vec3::Y`).
+    twist_axis: Vec<Vec3>,
+    /// Goal-agnostic accumulator.
+    global: BoneAccumulator,
+    /// Per-cell accumulators, created lazily as cells are observed.
+    cells: HashMap<u32, BoneAccumulator>,
+}
+
+/// Minimum samples a (cell, bone) pair needs before its cell-specific bias is
+/// emitted. Below this the cell omits the bone and [`MotionPrior::bias`] falls
+/// back to `global`.
+const MIN_CELL_SAMPLES: u32 = 2;
+
+impl MotionPriorBuilder {
+    /// A fresh builder for a skeleton of `num_bones` bones.
+    pub fn new(num_bones: usize) -> Self {
+        Self {
+            num_bones,
+            twist_axis: vec![Vec3::Y; num_bones],
+            global: BoneAccumulator::new(num_bones),
+            cells: HashMap::new(),
+        }
+    }
+
+    /// Override the twist axis used to decompose `bone`'s rotations.
+    pub fn set_twist_axis(&mut self, bone: usize, axis: Vec3) {
+        if bone < self.num_bones {
+            self.twist_axis[bone] = axis.normalize_or_zero();
+        }
+    }
+
+    /// Accumulate statistics from every frame of `clip` into the global bucket.
+    pub fn add_clip(&mut self, clip: &crate::clip::Clip) {
+        for frame in &clip.frames {
+            for (bone, &rot) in frame.local_rotations.iter().enumerate() {
+                if bone >= self.num_bones {
+                    break;
+                }
+                let axis = self.twist_axis[bone];
+                self.global.observe(bone, rot, axis);
+            }
+        }
+    }
+
+    /// Accumulate statistics from `clip` into BOTH the global bucket and the
+    /// goal-conditioned cell each frame falls into.
+    ///
+    /// For every frame we build a temporary [`Pose`](crate::ik::Pose) from the
+    /// frame's local rotations (preserving each bone's bind translation),
+    /// forward-kinematic the `effector_bone`'s head into the root bone's local
+    /// frame, and use that body-relative position as a [`GoalDescriptor`] to find
+    /// the frame's cell via [`goal_cell`]. The frame's per-bone swing-twist stats
+    /// then feed the global accumulator and that cell's accumulator.
+    pub fn add_clip_with_goal(
+        &mut self,
+        clip: &crate::clip::Clip,
+        skeleton: &crate::skeleton::Skeleton,
+        effector_bone: usize,
+    ) {
+        let root_bone = skeleton.roots().first().copied().unwrap_or(0);
+        for frame in &clip.frames {
+            let goal = frame_goal(frame, skeleton, root_bone, effector_bone);
+            let cell = goal_cell(&goal);
+            let cell_acc = self
+                .cells
+                .entry(cell)
+                .or_insert_with(|| BoneAccumulator::new(self.num_bones));
+            for (bone, &rot) in frame.local_rotations.iter().enumerate() {
+                if bone >= self.num_bones {
+                    break;
+                }
+                let axis = self.twist_axis[bone];
+                self.global.observe(bone, rot, axis);
+                cell_acc.observe(bone, rot, axis);
+            }
+        }
+    }
+
+    /// Finalize the accumulated statistics into a [`MotionPrior`].
+    ///
+    /// The global bucket finalizes with no minimum-sample gate (matching v1).
+    /// Each cell finalizes with a [`MIN_CELL_SAMPLES`] gate per bone; cells with
+    /// no qualifying bone are dropped so `bias` falls back to `global`.
+    pub fn build(self) -> MotionPrior {
+        let global = self.global.finalize(1);
+
+        let cells = self
+            .cells
+            .iter()
+            .filter(|(_, acc)| acc.any_dense(MIN_CELL_SAMPLES))
+            .map(|(&id, acc)| (id, acc.finalize(MIN_CELL_SAMPLES)))
+            .collect();
+
+        MotionPrior { global, cells }
+    }
+}
+
+/// Build a body-relative [`GoalDescriptor`] for one frame: forward-kinematic the
+/// effector's head into the root bone's local frame.
+fn frame_goal(
+    frame: &crate::clip::Frame,
+    skeleton: &crate::skeleton::Skeleton,
+    root_bone: usize,
+    effector_bone: usize,
+) -> GoalDescriptor {
+    use crate::ik::Pose;
+    use glam::Mat4;
+
+    // Temporary pose: each bone's local transform is its bind translation with
+    // the frame's local rotation applied (rotation about the bind origin).
+    let mut pose = Pose::from_bind(skeleton);
+    for (bone, &rot) in frame.local_rotations.iter().enumerate() {
+        if bone >= pose.local.len() {
+            break;
+        }
+        let translation = skeleton.bones[bone].local_bind.w_axis.truncate();
+        pose.local[bone] = Mat4::from_rotation_translation(rot, translation);
+    }
+
+    let effector_world = pose.head(skeleton, effector_bone);
+    let root_world = pose.global(skeleton, root_bone);
+    // Effector head expressed in the root bone's local frame (body-relative).
+    let target_local = root_world.inverse().transform_point3(effector_world);
+
+    GoalDescriptor {
+        target_local,
+        approach_local: target_local.normalize_or_zero(),
+        action_tag: None,
     }
 }
 
@@ -315,5 +526,142 @@ mod tests {
         let bias = prior.bias(42, &goal);
         assert_eq!(bias.axis_weight, Vec3::ONE);
         assert!(bias.preferred.abs_diff_eq(Quat::IDENTITY, 1e-6));
+    }
+
+    // ── Goal quantization ────────────────────────────────────────────────────
+
+    fn goal_at(target: Vec3) -> GoalDescriptor {
+        GoalDescriptor {
+            target_local: target,
+            approach_local: target.normalize_or_zero(),
+            action_tag: None,
+        }
+    }
+
+    #[test]
+    fn goal_cell_is_stable_and_distinguishes_direction_and_distance() {
+        // Stability: same input → same id.
+        let x = goal_at(Vec3::new(1.0, 0.0, 0.0));
+        assert_eq!(goal_cell(&x), goal_cell(&goal_at(Vec3::new(1.0, 0.0, 0.0))));
+
+        // +X vs +Y differ (different sector).
+        let y = goal_at(Vec3::new(0.0, 1.0, 0.0));
+        assert_ne!(goal_cell(&x), goal_cell(&y));
+
+        // Near vs far along +X differ (different shell), same sector.
+        let near = goal_at(Vec3::new(0.2, 0.0, 0.0)); // len 0.2 < SHELL_NEAR
+        let far = goal_at(Vec3::new(3.0, 0.0, 0.0)); // len 3.0 >= SHELL_FAR
+        assert_ne!(goal_cell(&near), goal_cell(&far));
+
+        // Zero-length target → fallback cell.
+        assert_eq!(goal_cell(&goal_at(Vec3::ZERO)), FALLBACK_CELL);
+    }
+
+    // ── v1 compatibility ─────────────────────────────────────────────────────
+
+    #[test]
+    fn v1_built_prior_falls_back_to_global() {
+        // Built the old way (add_clip + build): no cells, only global.
+        let mut frames = Vec::new();
+        for i in 0..9 {
+            frames.push(frame_with_bone1(Quat::from_rotation_y((i as f32 - 4.0) * 0.3)));
+        }
+        let clip = Clip { name: "y".into(), frame_rate: 30.0, frames };
+        let mut builder = MotionPriorBuilder::new(2);
+        builder.add_clip(&clip);
+        let prior = builder.build();
+
+        assert_eq!(prior.num_cells(), 0);
+        // A non-fallback goal still resolves via global (no cell data exists).
+        let bias = prior.bias(1, &goal_at(Vec3::new(1.0, 0.0, 0.0)));
+        assert!(bias.axis_weight.y > bias.axis_weight.x);
+    }
+
+    #[test]
+    fn global_only_json_deserializes_without_cells() {
+        // Simulate a v1-baked prior on disk: object with only `global`, no
+        // `cells` key. `#[serde(default)]` must fill the empty map.
+        let json = r#"{"global":[{"axis_weight":[1.0,2.0,1.0],"preferred":[0.0,0.0,0.0,1.0]}]}"#;
+        let prior: MotionPrior = serde_json::from_str(json).expect("deserialize v1 json");
+        assert_eq!(prior.len(), 1);
+        assert_eq!(prior.num_cells(), 0);
+        let bias = prior.bias(0, &goal_at(Vec3::new(0.0, 1.0, 0.0)));
+        assert!((bias.axis_weight.y - 2.0).abs() < 1e-6);
+    }
+
+    // ── Goal-conditioning ────────────────────────────────────────────────────
+
+    /// A 3-bone arm: fixed root, a steerable shoulder (bone 1), and an effector
+    /// tip (bone 2) offset along +X by `arm` from the shoulder. The shoulder's
+    /// rotation steers where the effector's FK head lands, so the shoulder's
+    /// posture and the body-relative goal are naturally coupled.
+    fn arm_skeleton(arm: f32) -> crate::skeleton::Skeleton {
+        use crate::skeleton::{Bone, Skeleton};
+        let mut sk = Skeleton::new();
+        let r = sk.add(Bone::root("root"));
+        let s = sk.add(Bone::new("shoulder", Some(r), Mat4::IDENTITY));
+        sk.add(Bone::new("effector", Some(s), Mat4::from_translation(Vec3::new(arm, 0.0, 0.0))));
+        sk
+    }
+
+    #[test]
+    fn goal_conditioning_separates_postures_by_goal() {
+        // Effector arm of length 2 from the shoulder along +X. Rotating the
+        // shoulder (bone 1) about +Z by +90° swings the effector head from ≈ +X
+        // to ≈ +Y. Each clip holds a distinct shoulder posture, so the +X-goal
+        // cell and the +Y-goal cell record different preferred rotations.
+        let sk = arm_skeleton(2.0);
+        let effector = 2usize;
+
+        let posture_a = Quat::IDENTITY; // clip A: shoulder unrotated → effector +X
+        let posture_b = Quat::from_rotation_z(std::f32::consts::FRAC_PI_2); // → +Y
+
+        let make = |posture: Quat| -> Clip {
+            let frames = (0..6)
+                .map(|_| Frame {
+                    root: Mat4::IDENTITY,
+                    local_rotations: vec![Quat::IDENTITY, posture, Quat::IDENTITY],
+                })
+                .collect();
+            Clip { name: "c".into(), frame_rate: 30.0, frames }
+        };
+        let clip_a = make(posture_a);
+        let clip_b = make(posture_b);
+
+        let mut builder = MotionPriorBuilder::new(3);
+        builder.add_clip_with_goal(&clip_a, &sk, effector);
+        builder.add_clip_with_goal(&clip_b, &sk, effector);
+        let prior = builder.build();
+
+        // Two distinct cells should have formed (+X shell, +Y shell).
+        assert!(prior.num_cells() >= 2, "expected ≥2 cells, got {}", prior.num_cells());
+
+        // Sanity: the cells the two goals resolve to are different.
+        let goal_x = goal_at(Vec3::new(2.0, 0.0, 0.0));
+        let goal_y = goal_at(Vec3::new(0.0, 2.0, 0.0));
+        assert_ne!(goal_cell(&goal_x), goal_cell(&goal_y));
+
+        let bias_x = prior.bias(1, &goal_x);
+        let bias_y = prior.bias(1, &goal_y);
+
+        // The +X-goal cell recorded posture_a; the +Y-goal cell posture_b.
+        let d = |q: Quat, p: Quat| (q.dot(p)).abs(); // 1.0 == identical
+        assert!(
+            d(bias_x.preferred, posture_a) > d(bias_x.preferred, posture_b),
+            "X-goal preferred {:?} should be nearer posture_a",
+            bias_x.preferred
+        );
+        assert!(
+            d(bias_y.preferred, posture_b) > d(bias_y.preferred, posture_a),
+            "Y-goal preferred {:?} should be nearer posture_b",
+            bias_y.preferred
+        );
+        // And the two cells' biases differ meaningfully.
+        assert!(
+            d(bias_x.preferred, bias_y.preferred) < 0.99,
+            "cells should differ: {:?} vs {:?}",
+            bias_x.preferred,
+            bias_y.preferred
+        );
     }
 }

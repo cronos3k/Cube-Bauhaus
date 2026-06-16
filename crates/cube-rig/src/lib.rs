@@ -46,7 +46,7 @@ pub use collision::{
 pub use controller::{RenderVertex, RigController};
 pub use limits::{g1_29dof_limits, JointLimit};
 pub use mesh::{Influence, RigVertex, SkinnedMesh, MAX_INFLUENCES};
-pub use prior::{GoalDescriptor, JointBias, MotionPrior, MotionPriorBuilder};
+pub use prior::{goal_cell, GoalDescriptor, JointBias, MotionPrior, MotionPriorBuilder};
 pub use select::{SelectMode, VertexSelection};
 pub use skeleton::{Bone, Skeleton};
 pub use state::{RigState, Tool};

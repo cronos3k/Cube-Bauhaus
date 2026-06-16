@@ -13,6 +13,7 @@ use crate::clip::Clip;
 use crate::import::gltf::{import_gltf_animations, import_gltf_skeleton};
 use crate::import::ImportError;
 use crate::prior::{MotionPrior, MotionPriorBuilder};
+use crate::skeleton::Skeleton;
 
 /// Outcome stats for a bake, for logging.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
@@ -128,6 +129,35 @@ pub fn bake_prior(clips: &[Clip]) -> MotionPrior {
     let mut builder = MotionPriorBuilder::new(num_bones);
     for clip in clips {
         builder.add_clip(clip);
+    }
+    builder.build()
+}
+
+/// Bake a **goal-conditioned** [`MotionPrior`] from clips.
+///
+/// Like [`bake_prior`] but additionally indexes each frame by the body-relative
+/// position of `effector_bone`, feeding a goal-conditioned cell grid (see
+/// [`goal_cell`](crate::prior::goal_cell)). Every frame still contributes to the
+/// `global` fallback bucket, so the result degrades gracefully to v1 behavior
+/// for goals whose cell lacks data.
+///
+/// `skeleton` supplies the bind pose used for the per-frame forward kinematics;
+/// it must match the clips' bone ordering. `effector_bone` is the bone whose FK
+/// head defines the goal (e.g. a hand or foot tip).
+///
+/// To get goal-conditioning from a directory of glTF/GLB clips, import the
+/// skeleton (via [`import_gltf_skeleton`]) and pass it here together with the
+/// clips from [`clips_from_path`]; the binary's default
+/// [`bake_prior_from_dir`] path stays goal-agnostic.
+pub fn bake_prior_with_goals(
+    clips: &[Clip],
+    skeleton: &Skeleton,
+    effector_bone: usize,
+) -> MotionPrior {
+    let num_bones = canonical_bone_count(clips).max(skeleton.len());
+    let mut builder = MotionPriorBuilder::new(num_bones);
+    for clip in clips {
+        builder.add_clip_with_goal(clip, skeleton, effector_bone);
     }
     builder.build()
 }
@@ -402,5 +432,35 @@ mod tests {
         assert_eq!(stats.bones, 2);
         assert!(!prior.is_empty());
         assert_eq!(prior.len(), 2);
+    }
+
+    // ── Test 5: bake_prior_with_goals forms goal-conditioned cells ───────────
+
+    #[test]
+    fn bake_prior_with_goals_forms_cells() {
+        // 3-bone arm: root, steerable shoulder (bone 1), effector tip (bone 2).
+        let mut sk = Skeleton::new();
+        let r = sk.add(Bone::root("root"));
+        let s = sk.add(Bone::new("shoulder", Some(r), Mat4::IDENTITY));
+        sk.add(Bone::new("tip", Some(s), Mat4::from_translation(Vec3::new(2.0, 0.0, 0.0))));
+
+        let make = |posture: Quat| Clip {
+            name: "c".into(),
+            frame_rate: 30.0,
+            frames: (0..6)
+                .map(|_| Frame {
+                    root: Mat4::IDENTITY,
+                    local_rotations: vec![Quat::IDENTITY, posture, Quat::IDENTITY],
+                })
+                .collect(),
+        };
+        // Shoulder unrotated → tip toward +X; +90° about Z → tip toward +Y.
+        let clip_x = make(Quat::IDENTITY);
+        let clip_y = make(Quat::from_rotation_z(std::f32::consts::FRAC_PI_2));
+
+        let prior = bake_prior_with_goals(&[clip_x, clip_y], &sk, 2);
+
+        assert!(prior.num_cells() >= 2, "expected ≥2 cells, got {}", prior.num_cells());
+        assert!(!prior.is_empty(), "global fallback must still be populated");
     }
 }
