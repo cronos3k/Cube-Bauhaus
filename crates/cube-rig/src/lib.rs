@@ -22,6 +22,7 @@
 
 pub mod anim;
 pub mod clip;
+pub mod collision;
 pub mod controller;
 pub mod export;
 pub mod ik;
@@ -37,6 +38,10 @@ pub mod viz;
 pub mod weights;
 
 pub use clip::{Clip, Frame};
+pub use collision::{
+    avoid_obstacles, bone_capsules, capsule_distance, capsule_penetration, closest_segment_points,
+    is_self_colliding, self_collisions, AvoidParams, Capsule, Contact,
+};
 pub use controller::{RenderVertex, RigController};
 pub use limits::{g1_29dof_limits, JointLimit};
 pub use mesh::{Influence, RigVertex, SkinnedMesh, MAX_INFLUENCES};
