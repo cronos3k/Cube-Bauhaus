@@ -351,7 +351,70 @@ without it.
 
 ---
 
-## 12. Open Questions
+## 12. Relationship to Generative Backbones (MotionBricks)
+
+Large-scale **neural generative** motion systems target the same end goal as this
+design — natural, controllable, real-time, constraint-respecting motion — but by
+the opposite mechanism. The clearest contemporary example is **MotionBricks**
+[Wang et al. 2026]: a single latent-token model trained on ~350k clips
+(700 hours, 27 joints) running at ~15,900 FPS / 2 ms. High-level "smart
+primitives" emit **target keyframes** through a unified interface; a coarse-to-fine
+backbone (root module → multi-head discrete pose-token module → decoder) generates
+the in-between motion. Plausibility is **learned implicitly**; constraints are
+**soft keyframe conditioning**, and the authors deliberately avoid strict
+enforcement because "strict enforcement would produce unnatural, over-constrained
+motion."
+
+The two approaches are **complementary, operating at different layers**, not
+competitors:
+
+| | Generative backbone (MotionBricks) | This design |
+|---|---|---|
+| Role | *What* skill, *where* to go (bulk full-body motion) | *Exact* effector placement + hard validity |
+| Plausibility | Learned from the corpus, implicit | Explicit hard limits + capsule collision + soft learned bias |
+| Contact | Soft / approximate by design | Precise, solved to the goal |
+| Self-penetration | Not guaranteed (model "should" avoid) | **Guaranteed** by capsule resolve-before-commit |
+| Joint limits | None explicit | Explicit per-axis swing-twist clamps |
+| Footprint | Large model, GPU | Microseconds, CPU, KB-scale baked table |
+
+**Architectural implication.** A generative backbone keeps contact soft and offers
+no hard guarantee against self-penetration or joint-limit violation — precisely
+the gap this system fills. The natural production stack is therefore:
+
+```
+  smart primitives / generative backbone  →  bulk full-body motion (approximate)
+                          │
+                          ▼
+  THIS SYSTEM (constrained IK pass)        →  precise contact + hard guarantees
+   • snap effector exactly onto the goal (hand on handle)
+   • clamp to hard joint limits
+   • resolve capsule self-collision before commit
+                          │
+                          ▼
+                       final pose
+```
+
+In this arrangement the goal-conditioned gradient field (§6–7) and the generative
+backbone draw on the *same* statistical insight — that learned motion priors beat
+hand-authored graphs — but apply it at different cost/guarantee points: the
+backbone generates richly and stochastically; this layer corrects deterministically
+and cheaply, with guarantees the learned model only approximates. The two compose:
+neither subsumes the other.
+
+This also clarifies scope. Building this system does **not** require adopting a
+generative backbone; the analytical core stands alone for any rig-driving,
+retargeting, or contact task. But it is designed to slot *underneath* one when a
+generative motion source is present.
+
+> **Reference.** T. Wang, O. Dionne, M. De Ruyter, D. Minor, D. Rempe,
+> K. Zhao, M. Petrovich, Y. Yuan, C. Li, Z. Luo, B. Robison, X. Blackwell,
+> B. Antoniazzi, X. B. Peng, Y. Zhu, S. Yuen. *MotionBricks: Scalable Real-Time
+> Motions with Modular Latent Generative Model and Smart Primitives.* ACM Trans.
+> Graph. 45(4), July 2026. arXiv:2604.24833. DOI 10.1145/3811334.
+
+---
+
+## 13. Open Questions
 
 1. **Corpus labels** — is the corpus a flat unlabeled dump, or grouped/named by
    action (`reach/`, `pull/`, …)? This decides whether the optional `action_tag`
