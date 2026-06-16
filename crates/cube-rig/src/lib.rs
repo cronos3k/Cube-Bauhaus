@@ -21,11 +21,14 @@
 //! egui tool palette.
 
 pub mod anim;
+pub mod clip;
 pub mod controller;
 pub mod export;
 pub mod ik;
 pub mod import;
+pub mod limits;
 pub mod mesh;
+pub mod prior;
 pub mod select;
 pub mod skeleton;
 pub mod skeleton_io;
@@ -33,8 +36,11 @@ pub mod state;
 pub mod viz;
 pub mod weights;
 
+pub use clip::{Clip, Frame};
 pub use controller::{RenderVertex, RigController};
+pub use limits::{g1_29dof_limits, JointLimit};
 pub use mesh::{Influence, RigVertex, SkinnedMesh, MAX_INFLUENCES};
+pub use prior::{GoalDescriptor, JointBias, MotionPrior, MotionPriorBuilder};
 pub use select::{SelectMode, VertexSelection};
 pub use skeleton::{Bone, Skeleton};
 pub use state::{RigState, Tool};

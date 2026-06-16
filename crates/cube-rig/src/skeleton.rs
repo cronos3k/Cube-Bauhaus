@@ -142,7 +142,7 @@ impl Skeleton {
 }
 
 /// Serialize a `Mat4` as a flat 16-element column-major array for JSON.
-mod mat4_serde {
+pub(crate) mod mat4_serde {
     use glam::Mat4;
     use serde::{Deserialize, Deserializer, Serialize, Serializer};
 
